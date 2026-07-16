@@ -1,7 +1,10 @@
 """Unit tests for the reusable health-audit interfaces."""
 
 import asyncio
+import sys
+from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from tools import health
 
 
@@ -35,6 +38,30 @@ class FakeCursor:
             return [(45, "api", 46, "worker", "00:02:00")]
         if "pg_statio_user_tables" in query:
             return [("public", "orders", 100_000_000, "95 MB")]
+        if "table_constraints" in query:
+            return [("public", "orders"), ("public", "products")]
+        if "constraint_type = 'FOREIGN KEY'" in query:
+            return [("public", "order_items", "order_id", "orders", "id")]
+        if "age(datfrozenxid)" in query:
+            return [("postgres", 500_000_000, 75.0)]
+        if "pg_index" in query and "indisprimary" in query:
+            return [
+                ("orders", "orders_pkey", "CREATE INDEX orders_pkey ON orders USING btree (id)"),
+                ("orders", "idx_orders_customer", "CREATE INDEX idx_orders_customer ON orders USING btree (customer_id)"),
+            ]
+        if "pg_stat_bgwriter" in query:
+            return [(100, 50, 500000, 30000, 2000)]
+        if "pg_is_in_recovery" in query:
+            return [("primary", 0)]
+        if "temp_blks_written" in query:
+            return [("SELECT * FROM large_table", 5, 12000.0, 512)]
+        if "pg_settings" in query:
+            return [
+                ("statement_timeout", "0", "ms", "Sets the maximum allowed duration of each statement."),
+                ("idle_in_transaction_session_timeout", "0", "ms", "Sets the maximum allowed duration of each idle-in-transaction session."),
+            ]
+        if "state = 'idle'" in query:
+            return [(99, "postgres", "app", "idle", 7200, "SELECT 1")]
         return []
 
     def fetchone(self) -> object:
@@ -55,6 +82,8 @@ class FakeCursor:
             return (0.95,)
         if "pg_database_size" in query:
             return (1_000_000_000, "954 MB")
+        if "pg_index" in query and "pg_get_indexdef" in query:
+            return None  # covered by fetchall
         return None
 
     def close(self) -> None:
@@ -87,6 +116,10 @@ def test_audit_connection_returns_all_finding_categories_and_keeps_connection_op
         "idle_transaction", "bloat", "autovacuum", "connection_utilization",
         "cache_hit_ratio", "index_usage", "sequential_scan", "blocking_process",
         "database_size", "table_size",
+        # New
+        "missing_primary_key", "missing_fk_index", "wraparound_age",
+        "redundant_index", "checkpoint_frequency", "replication_lag",
+        "temp_spilling", "timeout_config", "idle_timeout",
     }
     assert connection.closed is False
     assert connection.cursor_instance.closed is True
@@ -97,7 +130,7 @@ def test_sync_audit_uses_injected_connection_factory_and_closes_connection() -> 
 
     findings = health.run_health_audit_sync("test_database", connection_factory=lambda _: connection)
 
-    assert len(findings) == 16
+    assert len(findings) == 25  # was 16, now includes 9 new checks
     assert connection.closed is True
 
 

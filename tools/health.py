@@ -8,43 +8,22 @@ import os
 from collections.abc import Iterable
 from collections.abc import Callable
 from typing import Literal
-
 from pydantic import BaseModel
 
 from src.db_engine.connection import get_connection
+from src.db_engine.inspectors.statistics.statistics_inspector import StatisticsInspector
+from src.db_engine.queries.statistics_queries import (
+    GET_CHECKPOINT_STATS_QUERY,
+    GET_IDLE_CONNECTIONS_QUERY,
+    GET_REPLICATION_LAG_QUERY,
+    GET_TEMP_SPILLING_QUERY,
+    GET_TIMEOUT_CONFIG_QUERY,
+    GET_WRAPAROUND_AGE_QUERY,
+)
+from src.models.statistics.statistics_snapshot_model import StatisticsSnapshot
 
 
 logger = logging.getLogger(__name__)
-
-TOP_STATEMENTS_SQL = """
-    SELECT query, mean_exec_time
-    FROM pg_stat_statements
-    WHERE query NOT ILIKE 'EXPLAIN %'
-    ORDER BY mean_exec_time DESC
-    LIMIT 10
-"""
-
-BLOATED_TABLES_SQL = """
-    SELECT relname,
-           n_live_tup,
-           n_dead_tup,
-           n_dead_tup::numeric / NULLIF(n_live_tup + n_dead_tup, 0) AS dead_tuple_ratio
-    FROM pg_stat_user_tables
-    WHERE n_dead_tup::numeric / NULLIF(n_live_tup + n_dead_tup, 0) > 0.2
-    ORDER BY dead_tuple_ratio DESC
-"""
-
-LOCK_WAITS_SQL = """
-    SELECT pid,
-           datname,
-           usename,
-           wait_event,
-           now() - query_start AS wait_duration
-    FROM pg_stat_activity
-    WHERE wait_event_type = 'Lock'
-      AND state <> 'idle'
-    ORDER BY query_start
-"""
 
 LONG_RUNNING_QUERIES_SQL = """
     SELECT pid, datname, usename, now() - query_start AS duration, query
@@ -77,29 +56,6 @@ CONNECTION_UTILIZATION_SQL = """
     FROM pg_stat_activity
 """
 
-CACHE_HIT_RATIO_SQL = """
-    SELECT sum(blks_hit)::numeric / NULLIF(sum(blks_hit) + sum(blks_read), 0) AS cache_hit_ratio
-    FROM pg_stat_database
-    WHERE datname = current_database()
-"""
-
-UNUSED_INDEXES_SQL = """
-    SELECT schemaname, relname, indexrelname, idx_scan, pg_relation_size(indexrelid) AS index_size
-    FROM pg_stat_user_indexes
-    WHERE idx_scan = 0
-      AND indexrelname NOT LIKE '%_pkey'
-      AND pg_relation_size(indexrelid) > 10 * 1024 * 1024
-    ORDER BY pg_relation_size(indexrelid) DESC
-"""
-
-SEQUENTIAL_SCAN_STATS_SQL = """
-    SELECT relname, seq_scan, seq_tup_read, n_live_tup
-    FROM pg_stat_user_tables
-    WHERE seq_scan > 100
-      AND seq_tup_read > 100000
-    ORDER BY seq_tup_read DESC
-"""
-
 BLOCKING_GRAPH_SQL = """
     SELECT blocked.pid AS blocked_pid, blocked.usename AS blocked_user,
            blocker.pid AS blocking_pid, blocker.usename AS blocking_user,
@@ -110,11 +66,6 @@ BLOCKING_GRAPH_SQL = """
     ORDER BY blocked.query_start
 """
 
-DATABASE_SIZE_SQL = """
-    SELECT pg_database_size(current_database()) AS database_size,
-           pg_size_pretty(pg_database_size(current_database())) AS database_size_pretty
-"""
-
 TABLE_SIZE_RANKING_SQL = """
     SELECT schemaname, relname, pg_total_relation_size(relid) AS total_size,
            pg_size_pretty(pg_total_relation_size(relid)) AS total_size_pretty
@@ -122,7 +73,52 @@ TABLE_SIZE_RANKING_SQL = """
     ORDER BY pg_total_relation_size(relid) DESC
     LIMIT 10
 """
+# ===== New health check queries =====
 
+MISSING_PRIMARY_KEY_SQL = """
+    SELECT table_schema, table_name
+    FROM information_schema.tables
+    WHERE table_schema = 'public'
+      AND table_type = 'BASE TABLE'
+      AND table_name NOT IN (
+          SELECT table_name
+          FROM information_schema.table_constraints
+          WHERE constraint_type = 'PRIMARY KEY'
+            AND table_schema = 'public'
+      )
+    ORDER BY table_name;
+"""
+
+MISSING_FK_INDEX_SQL = """
+    SELECT
+        tc.table_schema,
+        tc.table_name,
+        kcu.column_name,
+        ccu.table_name AS target_table,
+        ccu.column_name AS target_column
+    FROM information_schema.table_constraints tc
+    JOIN information_schema.key_column_usage kcu
+        ON tc.constraint_catalog = kcu.constraint_catalog
+        AND tc.constraint_schema = kcu.constraint_schema
+        AND tc.constraint_name = kcu.constraint_name
+    JOIN information_schema.constraint_column_usage ccu
+        ON tc.constraint_catalog = ccu.constraint_catalog
+        AND tc.constraint_schema = ccu.constraint_schema
+        AND tc.constraint_name = ccu.constraint_name
+    WHERE tc.constraint_type = 'FOREIGN KEY'
+      AND tc.table_schema = 'public'
+    ORDER BY tc.table_schema, tc.table_name, kcu.ordinal_position;
+"""
+
+GET_DUPLICATE_INDEX_DEFS_SQL = """
+    SELECT
+        indrelid::regclass::text AS table_name,
+        indexrelid::regclass::text AS index_name,
+        pg_get_indexdef(indexrelid) AS index_definition
+    FROM pg_index
+    WHERE NOT indisprimary
+    ORDER BY indrelid, indexrelid;
+"""
 
 class HealthFinding(BaseModel):
     """A single actionable observation produced by the health audit."""
@@ -144,6 +140,16 @@ class HealthFinding(BaseModel):
         "blocking_process",
         "database_size",
         "table_size",
+        # New checks
+        "missing_primary_key",
+        "missing_fk_index",
+        "wraparound_age",
+        "redundant_index",
+        "checkpoint_frequency",
+        "replication_lag",
+        "temp_spilling",
+        "timeout_config",
+        "idle_timeout",
     ]
     title: str
     description: str
@@ -269,66 +275,332 @@ def _scan_query_plan(
             )
     return findings
 
+def _check_missing_primary_keys(cursor: object) -> list[HealthFinding]:
+    """Flag tables that have no primary key defined."""
+    findings: list[HealthFinding] = []
+    cursor.execute(MISSING_PRIMARY_KEY_SQL)
+    for row in cursor.fetchall():
+        table = _as_mapping(row, ("table_schema", "table_name"))
+        findings.append(HealthFinding(
+            severity="warning",
+            category="missing_primary_key",
+            title=f"Table {table['table_name']} has no primary key",
+            description=f"Table {table['table_schema']}.{table['table_name']} is a BASE TABLE without a primary key constraint.",
+            suggested_fix="Add a PRIMARY KEY using an appropriate column (typically an 'id' BIGSERIAL column).",
+        ))
+    return findings
 
-def audit_connection(connection: object) -> list[HealthFinding]:
-    """Audit an already-open PostgreSQL connection.
 
-    This is the most useful entry point for tests and custom scripts that manage
-    their own connection lifecycle.  The supplied connection remains open when
-    this function returns.
+def _check_missing_fk_indexes(cursor: object) -> list[HealthFinding]:
+    """Flag foreign key columns that lack an index."""
+    findings: list[HealthFinding] = []
+    cursor.execute(MISSING_FK_INDEX_SQL)
+    foreign_keys = cursor.fetchall()
+
+    # Get all existing indexes
+    cursor.execute("""
+        SELECT tablename, indexdef
+        FROM pg_indexes
+        WHERE schemaname = 'public'
+    """)
+    indexes = cursor.fetchall()
+    indexed_columns: dict[str, set[str]] = {}
+    for idx_row in indexes:
+        idx = _as_mapping(idx_row, ("tablename", "indexdef"))
+        table = str(idx["tablename"])
+        # Parse column names from index definition
+        defn = str(idx["indexdef"])
+        if "(" in defn and ")" in defn:
+            cols_part = defn.split("(")[1].split(")")[0]
+            for col in cols_part.split(","):
+                indexed_columns.setdefault(table, set()).add(col.strip().strip('"'))
+
+    for row in foreign_keys:
+        fk = _as_mapping(row, ("table_schema", "table_name", "column_name", "target_table", "target_column"))
+        table = str(fk["table_name"])
+        column = str(fk["column_name"])
+        if table not in indexed_columns or column not in indexed_columns[table]:
+            findings.append(HealthFinding(
+                severity="warning",
+                category="missing_fk_index",
+                title=f"Missing index on FK column {table}.{column}",
+                description=f"Foreign key column {table}.{column} references {fk['target_table']}.{fk['target_column']} but has no index.",
+                suggested_fix=f"CREATE INDEX idx_{table}_{column} ON {table}({column});",
+            ))
+    return findings
+
+
+def _check_wraparound_age(cursor: object) -> list[HealthFinding]:
+    """Flag databases approaching transaction ID wraparound."""
+    findings: list[HealthFinding] = []
+    cursor.execute(GET_WRAPAROUND_AGE_QUERY)
+    for row in cursor.fetchall():
+        db = _as_mapping(row, ("datname", "wraparound_age", "pct_to_wraparound"))
+        pct = float(db["pct_to_wraparound"])
+        if pct > 80:
+            findings.append(HealthFinding(
+                severity="critical",
+                category="wraparound_age",
+                title=f"Database {db['datname']} at {pct}% of wraparound limit",
+                description=f"Transaction age is {db['wraparound_age']:,} ({pct}% of autovacuum_freeze_max_age).",
+                suggested_fix="Run VACUUM FREEZE immediately or schedule aggressive autovacuum freezing.",
+            ))
+        elif pct > 50:
+            findings.append(HealthFinding(
+                severity="warning",
+                category="wraparound_age",
+                title=f"Database {db['datname']} at {pct}% of wraparound limit",
+                description=f"Transaction age is {db['wraparound_age']:,} ({pct}% of autovacuum_freeze_max_age).",
+                suggested_fix="Review autovacuum freeze settings and ensure regular VACUUM cycles.",
+            ))
+    return findings
+
+
+def _check_redundant_indexes(cursor: object) -> list[HealthFinding]:
+    """Detect potentially redundant/duplicate indexes."""
+    findings: list[HealthFinding] = []
+    cursor.execute(GET_DUPLICATE_INDEX_DEFS_SQL)
+    rows = cursor.fetchall()
+
+    # Group index definitions by table
+    from collections import defaultdict
+    table_indexes: dict[str, list[dict[str, object]]] = defaultdict(list)
+    for row in rows:
+        idx = _as_mapping(row, ("table_name", "index_name", "index_definition"))
+        table_indexes[str(idx["table_name"])].append({
+            "name": str(idx["index_name"]),
+            "def": str(idx["index_definition"]),
+        })
+
+    for table_name, indexes_list in table_indexes.items():
+        for i in range(len(indexes_list)):
+            for j in range(i + 1, len(indexes_list)):
+                a = indexes_list[i]["def"]
+                b = indexes_list[j]["def"]
+                # Simple heuristic: same columns in same order after stripping name
+                a_cols = a.split("(")[1].rstrip(")") if "(" in a else ""
+                b_cols = b.split("(")[1].rstrip(")") if "(" in b else ""
+                if a_cols and a_cols == b_cols:
+                    findings.append(HealthFinding(
+                        severity="warning",
+                        category="redundant_index",
+                        title=f"Duplicate indexes on {table_name}",
+                        description=f"Indexes {indexes_list[i]['name']} and {indexes_list[j]['name']} cover identical columns.",
+                        suggested_fix=f"Drop one of the duplicate indexes: DROP INDEX IF EXISTS {indexes_list[j]['name']};",
+                    ))
+                elif a_cols and b_cols.startswith(a_cols + ","):
+                    findings.append(HealthFinding(
+                        severity="info",
+                        category="redundant_index",
+                        title=f"Redundant index on {table_name}",
+                        description=f"Index {indexes_list[i]['name']} is a prefix of {indexes_list[j]['name']}.",
+                        suggested_fix=f"Consider whether {indexes_list[i]['name']} is still needed.",
+                    ))
+    return findings
+
+
+def _check_checkpoint_frequency(cursor: object) -> list[HealthFinding]:
+    """Flag excessive checkpoint activity."""
+    findings: list[HealthFinding] = []
+    cursor.execute(GET_CHECKPOINT_STATS_QUERY)
+    row = cursor.fetchone()
+    if row is not None:
+        stats = _as_mapping(row, (
+            "checkpoints_timed", "checkpoints_req",
+            "checkpoint_write_time", "checkpoint_sync_time",
+            "buffers_checkpoint",
+        ))
+        timed = int(stats["checkpoints_timed"])
+        req = int(stats["checkpoints_req"])
+        total = timed + req
+        if total > 0 and req / total > 0.3:
+            findings.append(HealthFinding(
+                severity="warning",
+                category="checkpoint_frequency",
+                title="High ratio of requested checkpoints",
+                description=f"{req} of {total} checkpoints were requested (not timed) — {req / total:.0%}.",
+                suggested_fix="Increase max_wal_size or checkpoint_completion_target to reduce forced checkpoints.",
+            ))
+    return findings
+
+
+def _check_replication_lag(cursor: object) -> list[HealthFinding]:
+    """Flag replication lag on standby servers."""
+    findings: list[HealthFinding] = []
+    cursor.execute(GET_REPLICATION_LAG_QUERY)
+    row = cursor.fetchone()
+    if row is not None:
+        status = _as_mapping(row, ("role", "replication_lag_seconds"))
+        if str(status["role"]) == "standby":
+            lag = int(status["replication_lag_seconds"])
+            if lag > 60:
+                findings.append(HealthFinding(
+                    severity="critical" if lag > 300 else "warning",
+                    category="replication_lag",
+                    title=f"Replication lag is {lag} seconds",
+                    description=f"The standby server is {lag} seconds behind the primary.",
+                    suggested_fix="Check network bandwidth, WAL archiving, and standby resources.",
+                ))
+    return findings
+
+
+def _check_temp_spilling(cursor: object) -> list[HealthFinding]:
+    """Flag queries that spill to temp files (work_mem too low)."""
+    findings: list[HealthFinding] = []
+    cursor.execute(GET_TEMP_SPILLING_QUERY)
+    for row in cursor.fetchall():
+        query = _as_mapping(row, ("query", "calls", "total_exec_time", "temp_mb_written"))
+        temp_mb = float(query["temp_mb_written"])
+        if temp_mb > 100:
+            findings.append(HealthFinding(
+                severity="warning",
+                category="temp_spilling",
+                title=f"Query spilled {temp_mb:.0f} MB to temp disk",
+                description=f"A query spilled {temp_mb:.0f} MB to temporary disk storage ({query['calls']} calls, {query['total_exec_time']:.0f} ms total).",
+                suggested_fix="Increase work_mem for this session or consider optimizing the query plan.",
+            ))
+    return findings
+
+
+def _check_timeout_config(cursor: object) -> list[HealthFinding]:
+    """Flag risky timeout configurations."""
+    findings: list[HealthFinding] = []
+    cursor.execute(GET_TIMEOUT_CONFIG_QUERY)
+    for row in cursor.fetchall():
+        setting = _as_mapping(row, ("name", "setting", "unit", "short_desc"))
+        if str(setting["name"]) == "statement_timeout" and str(setting["setting"]) == "0":
+            findings.append(HealthFinding(
+                severity="warning",
+                category="timeout_config",
+                title="Statement timeout is disabled",
+                description="statement_timeout is set to 0 (no limit). Long-running queries can run indefinitely.",
+                suggested_fix="Set statement_timeout to a reasonable limit, e.g., '30s' or '5min'.",
+            ))
+        if str(setting["name"]) == "idle_in_transaction_session_timeout" and str(setting["setting"]) == "0":
+            findings.append(HealthFinding(
+                severity="warning",
+                category="timeout_config",
+                title="Idle-in-transaction timeout is disabled",
+                description="idle_in_transaction_session_timeout is set to 0. Idle transactions can hold locks indefinitely.",
+                suggested_fix="Set idle_in_transaction_session_timeout to a reasonable value, e.g., '5min'.",
+            ))
+    return findings
+
+
+def _check_idle_connections(cursor: object) -> list[HealthFinding]:
+    """Flag connections idle for extended periods."""
+    findings: list[HealthFinding] = []
+    cursor.execute(GET_IDLE_CONNECTIONS_QUERY)
+    for row in cursor.fetchall():
+        conn = _as_mapping(row, ("pid", "datname", "usename", "state", "idle_seconds", "query"))
+        idle_min = int(conn["idle_seconds"]) / 60
+        findings.append(HealthFinding(
+            severity="info",
+            category="idle_timeout",
+            title=f"Session {conn['pid']} idle for {idle_min:.0f} minutes",
+            description=f"User {conn['usename']} in {conn['datname']} has been idle for {idle_min:.0f} minutes.",
+            suggested_fix="Consider terminating long-idle connections or configuring idle_in_transaction_session_timeout.",
+        ))
+    return findings
+
+class _BorrowedConnection:
+    """Prevent inspectors from closing a connection owned by ``audit_connection``."""
+
+    def __init__(self, connection: object) -> None:
+        self._connection = connection
+
+    def cursor(self, *args: object, **kwargs: object) -> object:
+        return self._connection.cursor(*args, **kwargs)
+
+    def close(self) -> None:
+        """Inspectors own their connections normally; this lease owns nothing."""
+
+
+def _statistics_findings(
+    snapshot: StatisticsSnapshot, connection: object, cursor: object
+) -> list[HealthFinding]:
+    """Apply health thresholds to data collected by ``StatisticsInspector``."""
+    findings: list[HealthFinding] = []
+
+    for statement in snapshot.query_stats:
+        findings.append(HealthFinding(
+            severity="warning", category="slow_query",
+            title="High mean execution time query",
+            description=f"This statement averages {statement.mean_exec_time:.2f} ms per execution.",
+            suggested_fix="Inspect its execution plan and reduce unnecessary I/O or row processing.",
+        ))
+        findings.extend(_scan_query_plan(connection, cursor, statement.query, statement.mean_exec_time))
+
+    for table in snapshot.table_stats:
+        total_tuples = table.n_live_tup + table.n_dead_tup
+        dead_tuple_ratio = table.n_dead_tup / total_tuples if total_tuples else 0
+        if dead_tuple_ratio > 0.2:
+            findings.append(HealthFinding(
+                severity="warning", category="bloat",
+                title=f"High dead tuple ratio on {table.table_name}",
+                description=(f"{table.table_name} has {table.n_dead_tup:,} dead tuples "
+                             f"({dead_tuple_ratio:.1%} of estimated tuples)."),
+                suggested_fix="Run VACUUM (ANALYZE) and review autovacuum thresholds for this table.",
+            ))
+        if table.seq_scan > 100 and table.n_live_tup > 100_000:
+            findings.append(HealthFinding(
+                severity="warning", category="sequential_scan",
+                title=f"Heavy sequential scan activity on {table.table_name}",
+                description=(f"{table.table_name} has {table.seq_scan:,} sequential scans "
+                             f"and an estimated {table.n_live_tup:,} live rows."),
+                suggested_fix="Review frequent predicates and verify whether an index improves the real query plan.",
+            ))
+
+    for index in snapshot.index_stats:
+        if index.idx_scan == 0:
+            findings.append(HealthFinding(
+                severity="info", category="index_usage",
+                title=f"Unused index {index.index_name}",
+                description=f"Index {index.table_name}.{index.index_name} has no recorded scans.",
+                suggested_fix="Validate over a representative workload before dropping the index.",
+            ))
+
+    for lock in snapshot.lock_stats:
+        if not lock.granted:
+            findings.append(HealthFinding(
+                severity="critical", category="lock",
+                title=f"Session {lock.pid} is waiting on a lock",
+                description=f"Session {lock.pid} is waiting for {lock.mode} on {lock.relation or 'an unknown relation'}.",
+                suggested_fix="Identify the blocking session and end or optimize the blocking transaction.",
+            ))
+
+    database = snapshot.database_stats
+    if database.cache_hit_ratio < 99:
+        findings.append(HealthFinding(
+            severity="warning", category="cache_hit_ratio", title="Low PostgreSQL cache hit ratio",
+            description=f"The current database cache hit ratio is {database.cache_hit_ratio:.1f}%.",
+            suggested_fix="Review shared_buffers, working set size, indexes, and queries causing unnecessary reads.",
+        ))
+    findings.append(HealthFinding(
+        severity="info", category="database_size", title="Database size baseline",
+        description=f"The database currently occupies {database.database_size_mb:.2f} MB.",
+        suggested_fix="Store this result periodically to calculate growth and plan storage capacity.",
+    ))
+    return findings
+
+
+def audit_connection(
+    connection: object, statistics_snapshot: StatisticsSnapshot | None = None
+) -> list[HealthFinding]:
+    """Audit an already-open connection without reimplementing statistics queries.
+
+    Supplying a snapshot avoids extra queries.  When omitted, the existing
+    ``StatisticsInspector`` is used with a non-closing lease of this connection.
+    The caller's connection remains open when this function returns.
     """
+    if statistics_snapshot is None:
+        statistics_snapshot = StatisticsInspector(
+            lambda: _BorrowedConnection(connection)
+        ).get_snapshot()
+
     cursor = connection.cursor()
     try:
-        findings: list[HealthFinding] = []
-
-        cursor.execute(TOP_STATEMENTS_SQL)
-        for row in cursor.fetchall():
-            statement = _as_mapping(row, ("query", "mean_exec_time"))
-            query = str(statement["query"])
-            mean_exec_time = float(statement["mean_exec_time"])
-            findings.append(
-                HealthFinding(
-                    severity="warning",
-                    category="slow_query",
-                    title="High mean execution time query",
-                    description=f"This statement averages {mean_exec_time:.2f} ms per execution.",
-                    suggested_fix="Inspect its execution plan and reduce unnecessary I/O or row processing.",
-                )
-            )
-            findings.extend(_scan_query_plan(connection, cursor, query, mean_exec_time))
-
-        cursor.execute(BLOATED_TABLES_SQL)
-        for row in cursor.fetchall():
-            table = _as_mapping(row, ("relname", "n_live_tup", "n_dead_tup", "dead_tuple_ratio"))
-            ratio = float(table["dead_tuple_ratio"])
-            findings.append(
-                HealthFinding(
-                    severity="warning",
-                    category="bloat",
-                    title=f"High dead tuple ratio on {table['relname']}",
-                    description=(
-                        f"{table['relname']} has {int(table['n_dead_tup']):,} dead tuples "
-                        f"({ratio:.1%} of estimated tuples)."
-                    ),
-                    suggested_fix="Run VACUUM (ANALYZE) and review autovacuum thresholds for this table.",
-                )
-            )
-
-        cursor.execute(LOCK_WAITS_SQL)
-        for row in cursor.fetchall():
-            lock = _as_mapping(row, ("pid", "datname", "usename", "wait_event", "wait_duration"))
-            findings.append(
-                HealthFinding(
-                    severity="critical",
-                    category="lock",
-                    title=f"Session {lock['pid']} is waiting on a lock",
-                    description=(
-                        f"User {lock['usename']} in database {lock['datname']} has waited "
-                        f"{lock['wait_duration']} for {lock['wait_event']}."
-                    ),
-                    suggested_fix="Identify the blocking session and end or optimize the blocking transaction.",
-                )
-            )
+        findings = _statistics_findings(statistics_snapshot, connection, cursor)
 
         cursor.execute(LONG_RUNNING_QUERIES_SQL)
         for row in cursor.fetchall():
@@ -374,35 +646,6 @@ def audit_connection(connection: object) -> list[HealthFinding]:
                     suggested_fix="Investigate connection leaks, use a pooler, and keep headroom for administrative connections.",
                 ))
 
-        cursor.execute(CACHE_HIT_RATIO_SQL)
-        cache_row = cursor.fetchone()
-        if cache_row is not None and cache_row[0] is not None:
-            cache_ratio = float(cache_row[0])
-            if cache_ratio < 0.99:
-                findings.append(HealthFinding(
-                    severity="warning", category="cache_hit_ratio", title="Low PostgreSQL cache hit ratio",
-                    description=f"The current database cache hit ratio is {cache_ratio:.1%}.",
-                    suggested_fix="Review shared_buffers, working set size, indexes, and queries causing unnecessary reads.",
-                ))
-
-        cursor.execute(UNUSED_INDEXES_SQL)
-        for row in cursor.fetchall():
-            index = _as_mapping(row, ("schemaname", "relname", "indexrelname", "idx_scan", "index_size"))
-            findings.append(HealthFinding(
-                severity="info", category="index_usage", title=f"Unused index {index['indexrelname']}",
-                description=f"Index {index['schemaname']}.{index['indexrelname']} on {index['relname']} has no recorded scans and uses {int(index['index_size']):,} bytes.",
-                suggested_fix="Validate over a representative workload before dropping the index.",
-            ))
-
-        cursor.execute(SEQUENTIAL_SCAN_STATS_SQL)
-        for row in cursor.fetchall():
-            table = _as_mapping(row, ("relname", "seq_scan", "seq_tup_read", "n_live_tup"))
-            findings.append(HealthFinding(
-                severity="warning", category="sequential_scan", title=f"Heavy sequential scan activity on {table['relname']}",
-                description=f"{table['relname']} has read {int(table['seq_tup_read']):,} rows through {int(table['seq_scan']):,} sequential scans.",
-                suggested_fix="Review frequent predicates and verify whether an index improves the real query plan.",
-            ))
-
         cursor.execute(BLOCKING_GRAPH_SQL)
         for row in cursor.fetchall():
             block = _as_mapping(row, ("blocked_pid", "blocked_user", "blocking_pid", "blocking_user", "wait_duration"))
@@ -410,16 +653,6 @@ def audit_connection(connection: object) -> list[HealthFinding]:
                 severity="critical", category="blocking_process", title=f"Session {block['blocking_pid']} is blocking session {block['blocked_pid']}",
                 description=f"{block['blocking_user']} is blocking {block['blocked_user']} for {block['wait_duration']}.",
                 suggested_fix="Inspect the blocker transaction and resolve it before cancelling blocked work.",
-            ))
-
-        cursor.execute(DATABASE_SIZE_SQL)
-        size_row = cursor.fetchone()
-        if size_row is not None:
-            size = _as_mapping(size_row, ("database_size", "database_size_pretty"))
-            findings.append(HealthFinding(
-                severity="info", category="database_size", title="Database size baseline",
-                description=f"The database currently occupies {size['database_size_pretty']} ({int(size['database_size']):,} bytes).",
-                suggested_fix="Store this result periodically to calculate growth and plan storage capacity.",
             ))
 
         cursor.execute(TABLE_SIZE_RANKING_SQL)
@@ -430,6 +663,16 @@ def audit_connection(connection: object) -> list[HealthFinding]:
                 description=f"This table and its indexes use {table['total_size_pretty']} ({int(table['total_size']):,} bytes).",
                 suggested_fix="Track this ranking over time and archive, partition, or retain less data where appropriate.",
             ))
+                # === New health checks ===
+        findings.extend(_check_missing_primary_keys(cursor))
+        findings.extend(_check_missing_fk_indexes(cursor))
+        findings.extend(_check_wraparound_age(cursor))
+        findings.extend(_check_redundant_indexes(cursor))
+        findings.extend(_check_checkpoint_frequency(cursor))
+        findings.extend(_check_replication_lag(cursor))
+        findings.extend(_check_temp_spilling(cursor))
+        findings.extend(_check_timeout_config(cursor))
+        findings.extend(_check_idle_connections(cursor))
         return findings
     finally:
         cursor.close()
@@ -442,17 +685,19 @@ def run_health_audit_sync(
 ) -> list[HealthFinding]:
     """Run the audit synchronously and return typed findings.
 
-    ``connection_factory`` is injectable so unit tests can pass a fake factory
-    instead of requiring PostgreSQL.  If ``database_name`` is omitted, ``DB_NAME``
-    is used.
+    ``connection_factory`` is injectable and must return a fresh connection for
+    each call because the reusable inspectors close their own connections. If
+    ``database_name`` is omitted, ``DB_NAME`` is used.
     """
     target_database = database_name or os.getenv("DB_NAME")
     if not target_database:
         raise ValueError("database_name is required when DB_NAME is not configured")
 
-    connection = connection_factory(target_database)
+    connection_provider = lambda: connection_factory(target_database)
+    statistics_snapshot = StatisticsInspector(connection_provider).get_snapshot()
+    connection = connection_provider()
     try:
-        return audit_connection(connection)
+        return audit_connection(connection, statistics_snapshot)
     finally:
         connection.close()
 

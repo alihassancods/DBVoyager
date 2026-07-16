@@ -103,3 +103,76 @@ FROM pg_stat_user_tables
 WHERE seq_scan > idx_scan
 ORDER BY seq_scan DESC;
 """
+#======================================Transaction Wraparound Age============================================
+
+GET_WRAPAROUND_AGE_QUERY = """
+SELECT
+    datname,
+    age(datfrozenxid) AS wraparound_age,
+    ROUND(age(datfrozenxid)::numeric / NULLIF(current_setting('autovacuum_freeze_max_age')::numeric, 0) * 100, 1) AS pct_to_wraparound
+FROM pg_database
+WHERE datallowconn
+ORDER BY age(datfrozenxid) DESC;
+"""
+
+#======================================Checkpoint Frequency============================================
+
+GET_CHECKPOINT_STATS_QUERY = """
+SELECT
+    checkpoints_timed,
+    checkpoints_req,
+    checkpoint_write_time,
+    checkpoint_sync_time,
+    buffers_checkpoint
+FROM pg_stat_bgwriter;
+"""
+
+#======================================Replication Lag============================================
+
+GET_REPLICATION_LAG_QUERY = """
+SELECT
+    CASE WHEN pg_is_in_recovery() THEN 'standby' ELSE 'primary' END AS role,
+    GREATEST(0, EXTRACT(EPOCH FROM now() - pg_last_xact_replay_timestamp()))::bigint AS replication_lag_seconds
+"""
+
+#======================================Temp Disk Spilling============================================
+
+GET_TEMP_SPILLING_QUERY = """
+SELECT
+    query,
+    calls,
+    total_exec_time,
+    temp_blks_written * 8 / 1024 AS temp_mb_written
+FROM pg_stat_statements
+WHERE temp_blks_written > 0
+ORDER BY temp_blks_written DESC
+LIMIT 10;
+"""
+
+#======================================Statement Timeout Config============================================
+
+GET_TIMEOUT_CONFIG_QUERY = """
+SELECT
+    name,
+    setting,
+    unit,
+    short_desc
+FROM pg_settings
+WHERE name IN ('statement_timeout', 'idle_in_transaction_session_timeout');
+"""
+
+#======================================Idle Connections============================================
+
+GET_IDLE_CONNECTIONS_QUERY = """
+SELECT
+    pid,
+    datname,
+    usename,
+    state,
+    EXTRACT(EPOCH FROM now() - state_change)::bigint AS idle_seconds,
+    query
+FROM pg_stat_activity
+WHERE state = 'idle'
+  AND state_change < now() - interval '30 minutes'
+ORDER BY state_change;
+"""
