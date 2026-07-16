@@ -1,14 +1,25 @@
-from src.db_engine.connection import get_connection
+import os
+import sys
+from pathlib import Path
 
+from dotenv import load_dotenv
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from src.db_engine.connection import get_connection
 from src.db_engine.inspectors.statistics.statistics_inspector import (
     StatisticsInspector,
 )
+
+load_dotenv()
+
+db_name = os.getenv("DB_NAME", "postgres")
 
 
 def main():
 
     inspector = StatisticsInspector(
-        connection_provider=get_connection
+        connection_provider=lambda: get_connection(database_name=db_name)
     )
 
     snapshot = inspector.get_snapshot()
