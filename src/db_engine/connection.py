@@ -1,7 +1,9 @@
-import os
-import psycopg2
+# src/db_engine/connection.py
 
-from dotenv import load_dotenv #type:ignore
+import os
+
+import psycopg2
+from dotenv import load_dotenv # type: ignore
 
 load_dotenv("/home/ali/Projects/DBVoyager/DBVoyager/.env")
 
