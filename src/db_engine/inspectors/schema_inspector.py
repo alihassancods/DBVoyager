@@ -43,15 +43,25 @@ class SchemaInspector:
             index_inspector=IndexInspector(connection_provider),
         )
 
-    def inspect(self) -> DatabaseSchema:
+    def inspect(self, progress: Callable[[str, str], None] | None = None) -> DatabaseSchema:
         """Collect and assemble all supported database schema metadata."""
         try:
-            tables = self._table_inspector.get_tables()
-            columns = self._column_inspector.get_columns()
-            primary_keys = self._key_inspector.get_primary_keys()
-            foreign_keys = self._key_inspector.get_foreign_keys()
+            def collect(name: str, callback: Callable[[], Any]) -> Any:
+                if progress:
+                    progress("schema", f"Collecting {name}.")
+                result = callback()
+                if progress:
+                    progress("schema", f"Collected {len(result)} {name}.")
+                return result
+
+            tables = collect("table metadata", self._table_inspector.get_tables)
+            columns = collect("column metadata", self._column_inspector.get_columns)
+            primary_keys = collect("primary keys", self._key_inspector.get_primary_keys)
+            foreign_keys = collect("foreign keys", self._key_inspector.get_foreign_keys)
             relations = self._relation_inspector.build_relations(foreign_keys)
-            indexes = self._index_inspector.get_indexes()
+            if progress:
+                progress("schema", "Building table relationships.")
+            indexes = collect("indexes", self._index_inspector.get_indexes)
             return DatabaseSchema(
                 tables=tables,
                 columns=columns,

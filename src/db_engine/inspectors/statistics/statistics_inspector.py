@@ -62,29 +62,21 @@ class StatisticsInspector:
             connection_provider
         )
 
-    def get_snapshot(
-        self,
-    ) -> StatisticsSnapshot:
+    def get_snapshot(self, progress: Callable[[str, str], None] | None = None) -> StatisticsSnapshot:
 
-        query_stats = (
-            self._query_inspector.get_query_stats()
-        )
+        def collect(name: str, callback: Callable[[], list[Any]]) -> list[Any]:
+            if progress:
+                progress("statistics", f"Collecting {name}.")
+            result = callback()
+            if progress:
+                progress("statistics", f"Collected {len(result)} {name}.")
+            return result
 
-        table_stats = (
-            self._table_inspector.get_table_stats()
-        )
-
-        index_stats = (
-            self._index_inspector.get_index_stats()
-        )
-
-        lock_stats = (
-            self._lock_inspector.get_lock_stats()
-        )
-
-        database_stats_list = (
-            self._database_inspector.get_database_stats()
-        )
+        query_stats = collect("query statistics", self._query_inspector.get_query_stats)
+        table_stats = collect("table statistics", self._table_inspector.get_table_stats)
+        index_stats = collect("index statistics", self._index_inspector.get_index_stats)
+        lock_stats = collect("lock statistics", self._lock_inspector.get_lock_stats)
+        database_stats_list = collect("database statistics", self._database_inspector.get_database_stats)
 
         database_stats = (
             database_stats_list[0]
