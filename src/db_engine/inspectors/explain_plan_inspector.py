@@ -66,7 +66,12 @@ class ExplainPlanInspector:
                     "PostgreSQL returned no execution plan."
                 )
 
-            raw_plan = row["QUERY PLAN"]
+            # Robust key checking: PostgreSQL can return "QUERY PLAN" or "query plan"
+            raw_plan = row.get("QUERY PLAN") or row.get("query plan")
+            
+            if raw_plan is None:
+                # If using RealDictCursor failed to map it, fallback to fetching by index
+                raw_plan = list(row.values())[0]
 
             return ExplainPlan(
                 raw_plan=raw_plan,
@@ -74,12 +79,18 @@ class ExplainPlanInspector:
             )
 
         except psycopg2.Error as exc:
+            # We catch database-side errors (e.g., Table does not exist, syntax errors)
             self._logger.exception(
-                "Failed to generate execution plan."
+                f"Database error during EXPLAIN generation: {exc.pgerror or exc}"
             )
             raise RuntimeError(
-                "Execution plan generation failed."
+                f"Execution plan generation failed: {exc.pgcode or 'Unknown database error'}"
             ) from exc
+            
+        except Exception as exc:
+            # Catch unexpected Python exceptions (KeyError, TypeError, etc.) so your API doesn't cleanly hide them
+            self._logger.exception("Unexpected error processing execution plan.")
+            raise RuntimeError(f"Internal processing failed: {str(exc)}") from exc
 
         finally:
             if connection is not None:
@@ -94,7 +105,13 @@ class ExplainPlanInspector:
         """
 
         try:
-            root_node = plan[0]["Plan"]
+            # If the raw plan is a list containing a single dictionary representing the plan
+            if isinstance(plan, list) and len(plan) > 0:
+                root_node = plan[0]["Plan"]
+            elif isinstance(plan, dict):
+                root_node = plan["Plan"]
+            else:
+                raise ValueError("Unexpected plan payload type.")
 
             return ExplainCost(
                 startup_cost=float(
