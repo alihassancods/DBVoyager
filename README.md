@@ -212,6 +212,12 @@ curl commands above or change `v2.py` to skip signup.
 | `GET /auth/me` | bearer JWT | Verify and return the current JWT identity. |
 | `POST /connections` | bearer JWT | Validate, encrypt, persist, and open a customer DB connection. |
 | `GET /connections/{connection_id}/analysis-runs/{run_id}` | bearer JWT | Poll a persistent analysis run and retrieve its report. |
+| `GET /connections/{connection_id}/kpis/candidates` | bearer JWT | List pending/proposed KPI candidates. |
+| `POST /connections/{connection_id}/kpis/candidates/{candidate_id}/approve` | bearer JWT | Approve, execute, and return a KPI chart snapshot. |
+| `POST /connections/{connection_id}/kpis/candidates/{candidate_id}/reject` | bearer JWT | Reject a KPI candidate. |
+| `GET /connections/{connection_id}/kpis/definitions` | bearer JWT | List approved KPI definitions. |
+| `GET /connections/{connection_id}/kpis/definitions/{definition_id}/chart` | bearer JWT | Return the latest chart-agnostic KPI data. |
+| `POST /connections/{connection_id}/kpis/definitions/{definition_id}/refresh` | bearer JWT | Re-run an approved KPI aggregate and return chart data. |
 | `POST /queries` | bearer JWT | Execute a query through an owned live connection. |
 | `DELETE /connections/{connection_id}` | bearer JWT | Close an owned live connection. |
 
