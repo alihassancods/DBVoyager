@@ -6,7 +6,7 @@ from .auth import router as auth_router
 from .connections import router as connections_router
 from .dashboard import router as dashboard_router
 from .optimizer import router as optimizer_router
-
+from .business_api import router as business_router # Import the new router
 
 app = FastAPI(
     title="DBVoyager API",
@@ -26,3 +26,4 @@ app.include_router(connections_router)
 app.include_router(dashboard_router)
 app.include_router(optimizer_router)
 app.include_router(auth_router)
+app.include_router(business_router) # Include it here
