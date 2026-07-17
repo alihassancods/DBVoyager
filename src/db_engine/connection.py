@@ -6,7 +6,7 @@ from urllib.parse import urlparse
 import psycopg2
 from dotenv import load_dotenv # type: ignore
 
-load_dotenv("/home/ali/Projects/DBVoyager/DBVoyager/.env")
+load_dotenv()
 
 
 def get_connection(database_name: str | None = None):
