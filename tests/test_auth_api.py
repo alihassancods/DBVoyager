@@ -12,6 +12,13 @@ from src.api.main import app
 client = TestClient(app)
 
 
+def test_frontend_cors_allows_vite_loopback_and_exposes_auth_jwt() -> None:
+    response = client.get("/", headers={"Origin": "http://127.0.0.1:5173"})
+
+    assert response.headers["access-control-allow-origin"] == "http://127.0.0.1:5173"
+    assert response.headers["access-control-expose-headers"] == "set-auth-jwt"
+
+
 def test_signup_proxies_to_neon_auth(monkeypatch) -> None:
     monkeypatch.setenv("NEON_AUTH_BASE_URL", "https://auth.example.test/neondb/auth")
     request = AsyncMock(

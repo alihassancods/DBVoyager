@@ -1,0 +1,38 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@500&family=Space+Grotesk:wght@500;600;700&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --voyager-navy: 5 12 26; --voyager-navy2: 9 22 41; --voyager-surface: 13 31 56; --voyager-surface2: 17 40 68;
+  --voyager-blue: 14 165 233; --voyager-blue-light: 56 189 248; --voyager-success: 16 185 129; --voyager-warning: 245 158 11; --voyager-critical: 239 68 68;
+  --voyager-text-primary: 241 245 249; --voyager-text-secondary: 148 163 184; --voyager-text-muted: 71 85 105; --voyager-border: 14 165 233;
+}
+
+html { scroll-behavior: smooth; }
+body { margin: 0; background: rgb(var(--voyager-navy)); color: rgb(var(--voyager-text-primary)); font-family: Inter, system-ui, sans-serif; }
+.light {
+  --voyager-navy: 248 250 252; --voyager-navy2: 241 245 249; --voyager-surface: 255 255 255; --voyager-surface2: 226 232 240;
+  --voyager-text-primary: 15 23 42; --voyager-text-secondary: 71 85 105; --voyager-text-muted: 100 116 139; --voyager-border: 2 132 199;
+}
+.voyager-card { background: rgb(var(--voyager-surface)); border: 1px solid rgb(var(--voyager-border) / .15); border-radius: 12px; box-shadow: 0 0 20px rgb(var(--voyager-blue) / .05); }
+.voyager-glow:hover, .voyager-glow:focus-visible { border-color: rgb(var(--voyager-border) / .4); box-shadow: 0 0 20px rgb(var(--voyager-blue) / .15); }
+.sql-text { font-family: 'JetBrains Mono', ui-monospace, monospace; font-size: 13px; }
+.auth-input { display: block; width: 100%; box-sizing: border-box; margin-top: 7px; border: 1px solid rgb(var(--voyager-border) / .25); border-radius: 8px; background: rgb(var(--voyager-navy2)); color: rgb(var(--voyager-text-primary)); padding: 12px; font: inherit; outline: none; }
+.auth-input:focus { border-color: rgb(var(--voyager-blue)); box-shadow: 0 0 0 3px rgb(var(--voyager-blue) / .15); }
+@keyframes float { 50% { transform: translateY(-10px); } }
+
+/* Stitch-inspired editor grid, adapted to DBVoyager's deep-space palette. */
+.stitch-grid {
+  background: radial-gradient(circle at 50% 20%, rgb(var(--voyager-blue) / .18), transparent 38%);
+}
+
+.stitch-grid::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  background: linear-gradient(rgb(var(--voyager-navy) / 0) 0%, rgb(var(--voyager-navy)) 96%);
+  pointer-events: none;
+}

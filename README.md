@@ -68,7 +68,27 @@ For a complete example from sign-up through schema/health exploration, read
 The product roadmap and autonomous-agent safety workflow are in
 [WORKFLOW_PLAN.md](WORKFLOW_PLAN.md).
 
-## 3. Authenticate with curl
+## 3. Run the frontend
+
+The React landing page lives in `frontend/`. Use Node.js 20 or newer:
+
+```bash
+cd frontend
+npm install
+npm run dev
+```
+
+Open <http://127.0.0.1:5173>. To create a production build:
+
+```bash
+npm run build
+```
+
+Sign Up and Sign In use `POST /auth/signup` and `POST /auth/login` on the API
+at `http://localhost:8000` by default. To use a different API origin, create
+`frontend/.env` with `VITE_API_URL=https://your-api.example`.
+
+## 4. Authenticate with curl
 
 The examples use `jq` to read JSON. Replace the email and password.
 
