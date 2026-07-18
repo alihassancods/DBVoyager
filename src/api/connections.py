@@ -9,8 +9,9 @@ from pydantic import BaseModel, Field
 
 from .auth import current_user
 from .analysis_repository import create_analysis_run, run_analysis_in_background
-from .connection_repository import save_connection
+from .connection_repository import connection_metadata, list_connections, load_connection_credentials, rename_connection, save_connection, set_archived
 from .store import _connections, _connection_owners, _credentials, _lock, _reports, connection_provider, get_connection, register_connection
+from src.agent.business_intelligence.validator import SQLValidator
 
 
 router = APIRouter()
@@ -29,6 +30,73 @@ class DatabaseCredentials(BaseModel):
 class QueryRequest(BaseModel):
     connection_id: str
     query: str = Field(min_length=1)
+
+
+class ConnectionUpdateRequest(BaseModel):
+    display_name: str = Field(min_length=1, max_length=200)
+
+
+class ScopedQueryRequest(BaseModel):
+    query: str = Field(min_length=1)
+
+
+@router.get("/connections")
+def connections(user: dict[str, object] = Depends(current_user)) -> dict[str, list[dict[str, Any]]]:
+    return {"data": list_connections(str(user["sub"]))}
+
+
+@router.get("/connections/{connection_id}")
+def connection_details(connection_id: str, user: dict[str, object] = Depends(current_user)) -> dict[str, Any]:
+    return connection_metadata(connection_id, str(user["sub"]))
+
+
+@router.patch("/connections/{connection_id}")
+def update_connection(connection_id: str, payload: ConnectionUpdateRequest, user: dict[str, object] = Depends(current_user)) -> dict[str, Any]:
+    return rename_connection(connection_id, str(user["sub"]), payload.display_name)
+
+
+@router.post("/connections/{connection_id}/archive", status_code=status.HTTP_204_NO_CONTENT)
+def archive_connection(connection_id: str, user: dict[str, object] = Depends(current_user)) -> None:
+    set_archived(connection_id, str(user["sub"]), True)
+
+
+@router.post("/connections/{connection_id}/restore", status_code=status.HTTP_204_NO_CONTENT)
+def restore_connection(connection_id: str, user: dict[str, object] = Depends(current_user)) -> None:
+    set_archived(connection_id, str(user["sub"]), False)
+
+
+@router.post("/connections/{connection_id}/reconnect")
+def reconnect_connection(connection_id: str, user: dict[str, object] = Depends(current_user)) -> dict[str, str]:
+    owner = str(user["sub"])
+    credentials = load_connection_credentials(connection_id, owner)
+    try:
+        connection = psycopg2.connect(**credentials, connect_timeout=10)
+    except psycopg2.Error as exc:
+        raise HTTPException(status_code=400, detail="Could not reconnect to database") from exc
+    register_connection(connection_id, owner, connection, credentials)
+    return {"connection_id": connection_id, "status": "connected"}
+
+
+@router.post("/connections/{connection_id}/test")
+def test_connection(
+    connection_id: str, credentials: DatabaseCredentials, user: dict[str, object] = Depends(current_user)
+) -> dict[str, str]:
+    """Validate supplied credentials without persisting them."""
+    connection_metadata(connection_id, str(user["sub"]))
+    connection_data = credentials.model_dump(exclude={"display_name"})
+    try:
+        connection = psycopg2.connect(**connection_data, connect_timeout=10)
+    except psycopg2.Error as exc:
+        raise HTTPException(status_code=400, detail="Could not connect to database") from exc
+    connection.close()
+    return {"status": "ok"}
+
+
+@router.post("/connections/{connection_id}/queries")
+def execute_connection_query(
+    connection_id: str, request: ScopedQueryRequest, user: dict[str, object] = Depends(current_user)
+) -> dict[str, object]:
+    return execute_query(QueryRequest(connection_id=connection_id, query=request.query), user)
 
 
 @router.post("/connections", status_code=status.HTTP_201_CREATED)
@@ -88,6 +156,9 @@ def execute_query(
     request: QueryRequest,
     user: dict[str, object] = Depends(current_user),
 ) -> dict[str, object]:
+    validation = SQLValidator().validate(request.query)
+    if not validation.is_valid:
+        raise HTTPException(status_code=400, detail=validation.reason)
     connection = get_connection(request.connection_id, str(user["sub"]))
     try:
         with connection.cursor(cursor_factory=RealDictCursor) as cursor:

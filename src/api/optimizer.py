@@ -1,178 +1,145 @@
-# src/api/optimizer.py
+"""Owner-scoped query optimizer endpoints."""
 
-"""
-FastAPI routes for the Query Optimizer feature.
+from typing import Any
 
-Responsibilities:
-- Validate requests
-- Create dependencies
-- Delegate work to QueryOptimizerAgent
-- Return typed responses
+from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel, Field
+from psycopg2.extras import Json
 
-No business logic should live here.
-"""
-
-from fastapi import APIRouter, HTTPException #type: ignore
-
+from src.agent.business_intelligence.validator import SQLValidator
 from src.agent.query_optimizer.optimizer_agent import QueryOptimizerAgent
+from src.db_engine.inspectors.explain_plan_inspector import ExplainPlanInspector
+from src.db_engine.inspectors.schema_inspector import SchemaInspector
+from src.db_engine.inspectors.statistics.query_stats_inspector import QueryStatsInspector
+from src.models.api.optimizer_request import CompareQueryRequest, OptimizeQueryRequest
 
-from src.db_engine.connection import get_connection
-
-from src.db_engine.inspectors.schema_inspector import (
-    SchemaInspector,
-)
-
-from src.db_engine.inspectors.statistics.query_stats_inspector import (
-    QueryStatsInspector,
-)
-
-from src.db_engine.inspectors.explain_plan_inspector import (
-    ExplainPlanInspector,
-)
-
-from src.models.api.optimizer_request import (
-    OptimizeQueryRequest,
-    CompareQueryRequest,
-)
-
-from src.models.api.optimizer_response import (
-    SlowQueriesResponse,
-    SlowQueryResponse,
-    OptimizeQueryResponse,
-    CompareQueryResponse,
-)
-
-router = APIRouter(
-    prefix="/optimizer",
-    tags=["Query Optimizer"],
-)
+from .analysis_repository import ensure_owned_database, get_latest_slow_queries, get_slow_query
+from .auth import current_user
+from .store import connection_provider, get_connection
 
 
-def connection_provider():
-    """
-    Shared PostgreSQL connection provider.
-    """
-    return get_connection()
+router = APIRouter(prefix="/connections/{connection_id}/optimizer", tags=["Query Optimizer"])
 
 
-def get_optimizer_agent() -> QueryOptimizerAgent:
-    """
-    Construct a QueryOptimizerAgent using existing inspectors.
-    """
+class FeedbackRequest(BaseModel):
+    feedback: str = Field(pattern="^(useful|not_useful)$")
+    note: str | None = Field(default=None, max_length=1_000)
 
+
+def _owner_subject(user: dict[str, object]) -> str:
+    return str(user["sub"])
+
+
+def _agent(connection_id: str) -> QueryOptimizerAgent:
+    provider = connection_provider(connection_id)
     return QueryOptimizerAgent(
-        query_stats_inspector=QueryStatsInspector(
-            connection_provider
-        ),
-        schema_inspector=SchemaInspector.from_connection_provider(
-            connection_provider
-        ),
-        explain_plan_inspector=ExplainPlanInspector(
-            connection_provider
-        ),
+        query_stats_inspector=QueryStatsInspector(provider),
+        schema_inspector=SchemaInspector.from_connection_provider(provider),
+        explain_plan_inspector=ExplainPlanInspector(provider),
     )
 
 
-@router.get(
-    "/slow-queries",
-    response_model=SlowQueriesResponse,
-)
-def get_slow_queries() -> SlowQueriesResponse:
-    """
-    Return the slowest queries from pg_stat_statements.
-    """
-
-    try:
-        agent = get_optimizer_agent()
-
-        queries = agent.get_slow_queries()
-
-        return SlowQueriesResponse(
-            queries=[
-                SlowQueryResponse(
-                    query=query.query,
-                    calls=query.calls,
-                    total_exec_time=query.total_exec_time,
-                    mean_exec_time=query.mean_exec_time,
-                    rows_returned=query.rows_returned,
-                )
-                for query in queries
-            ]
-        )
-
-    except Exception as exc:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to retrieve slow queries: {str(exc)}",
-        ) from exc
+def _owned_agent(connection_id: str, user: dict[str, object]) -> QueryOptimizerAgent:
+    owner = _owner_subject(user)
+    ensure_owned_database(connection_id, owner)
+    get_connection(connection_id, owner)
+    return _agent(connection_id)
 
 
-@router.post(
-    "/optimize",
-    response_model=OptimizeQueryResponse,
-)
+@router.get("/slow-queries")
+def slow_queries(
+    connection_id: str,
+    limit: int = Query(default=20, ge=1, le=100),
+    user: dict[str, object] = Depends(current_user),
+) -> dict[str, list[dict[str, Any]]]:
+    owner = _owner_subject(user)
+    ensure_owned_database(connection_id, owner)
+    return {"data": get_latest_slow_queries(connection_id, owner, limit)}
+
+
+@router.post("/optimizations")
 def optimize_query(
+    connection_id: str,
     request: OptimizeQueryRequest,
-) -> OptimizeQueryResponse:
-    """
-    Optimize a SQL query using:
-    - Schema context
-    - EXPLAIN plan
-    - DeepSeek
-    """
+    user: dict[str, object] = Depends(current_user),
+) -> dict[str, Any]:
+    owner = _owner_subject(user)
+    agent = _owned_agent(connection_id, user)
+    query = get_slow_query(connection_id, owner, request.query_id)
+    validation = SQLValidator().validate(query)
+    if not validation.is_valid:
+        raise HTTPException(status_code=400, detail=f"Stored query is unsafe: {validation.reason}")
+    result = agent.optimize_query(query)
+    from .analysis_repository import _app_connection
+    with _app_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("""
+                INSERT INTO query_optimizations (
+                    monitored_database_id, query_snapshot_id, original_query, optimized_query, explanation, index_recommendations
+                ) VALUES (%s, %s, %s, %s, %s, %s) RETURNING id
+            """, (connection_id, request.query_id, result.original_query, result.optimized_query,
+                   result.explanation, Json(result.index_recommendations)))
+            optimization_id = str(cursor.fetchone()[0])
+    return {
+        "optimization_id": optimization_id,
+        "query_id": request.query_id,
+        "original_query": result.original_query,
+        "optimized_query": result.optimized_query,
+        "explanation": result.explanation,
+        "index_recommendations": result.index_recommendations,
+    }
 
-    try:
-        agent = get_optimizer_agent()
 
-        result = agent.optimize_query(
-            request.query
-        )
-
-        return OptimizeQueryResponse(
-            original_query=result.original_query,
-            optimized_query=result.optimized_query,
-            explanation=result.explanation,
-            index_recommendations=result.index_recommendations,
-        )
-
-    except Exception as exc:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Query optimization failed: {str(exc)}",
-        ) from exc
-
-
-@router.post(
-    "/compare",
-    response_model=CompareQueryResponse,
-)
+@router.post("/optimizations/compare")
 def compare_queries(
+    connection_id: str,
     request: CompareQueryRequest,
-) -> CompareQueryResponse:
-    """
-    Compare original and optimized query costs using EXPLAIN.
-    """
+    user: dict[str, object] = Depends(current_user),
+) -> dict[str, float | int]:
+    for query in (request.original_query, request.optimized_query):
+        validation = SQLValidator().validate(query)
+        if not validation.is_valid:
+            raise HTTPException(status_code=400, detail=validation.reason)
+    comparison = _owned_agent(connection_id, user).compare_queries(
+        request.original_query, request.optimized_query
+    )
+    return comparison.model_dump()
 
-    try:
-        agent = get_optimizer_agent()
 
-        comparison = agent.compare_queries(
-            request.original_query,
-            request.optimized_query,
-        )
+@router.get("/optimizations/{optimization_id}")
+def optimization(
+    connection_id: str, optimization_id: str, user: dict[str, object] = Depends(current_user)
+) -> dict[str, Any]:
+    owner = _owner_subject(user)
+    ensure_owned_database(connection_id, owner)
+    from .analysis_repository import _app_connection
+    with _app_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("""
+                SELECT id, original_query, optimized_query, explanation, index_recommendations, feedback, feedback_note, created_at
+                FROM query_optimizations WHERE id = %s AND monitored_database_id = %s
+            """, (optimization_id, connection_id))
+            row = cursor.fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Optimization not found")
+    return {"optimization_id": str(row[0]), "original_query": row[1], "optimized_query": row[2],
+            "explanation": row[3], "index_recommendations": row[4], "feedback": row[5],
+            "feedback_note": row[6], "created_at": row[7]}
 
-        return CompareQueryResponse(
-            startup_cost_before=comparison.startup_cost_before,
-            startup_cost_after=comparison.startup_cost_after,
-            total_cost_before=comparison.total_cost_before,
-            total_cost_after=comparison.total_cost_after,
-            estimated_rows_before=comparison.estimated_rows_before,
-            estimated_rows_after=comparison.estimated_rows_after,
-            improvement_percent=comparison.improvement_percent,
-        )
 
-    except Exception as exc:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Query comparison failed: {str(exc)}",
-        ) from exc
+@router.post("/optimizations/{optimization_id}/feedback")
+def optimization_feedback(
+    connection_id: str, optimization_id: str, payload: FeedbackRequest,
+    user: dict[str, object] = Depends(current_user),
+) -> dict[str, str]:
+    owner = _owner_subject(user)
+    ensure_owned_database(connection_id, owner)
+    from .analysis_repository import _app_connection
+    with _app_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("""UPDATE query_optimizations SET feedback = %s, feedback_note = %s
+                              WHERE id = %s AND monitored_database_id = %s""",
+                           (payload.feedback, payload.note, optimization_id, connection_id))
+            if cursor.rowcount != 1:
+                raise HTTPException(status_code=404, detail="Optimization not found")
+    return {"optimization_id": optimization_id, "feedback": payload.feedback}

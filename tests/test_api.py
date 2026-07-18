@@ -79,6 +79,8 @@ def test_dashboard_refresh_persists_and_reads_the_latest_report() -> None:
         ), patch("src.api.dashboard.run_analysis", return_value=report), patch(
             "src.api.dashboard.get_latest_report", return_value=report
         ), patch(
+            "src.api.dashboard.get_latest_collection_report", return_value=report
+        ), patch(
             "src.api.dashboard.get_analysis_run", return_value=run
         ):
             refreshed = client.post("/connections/connection-1/dashboard/refresh")

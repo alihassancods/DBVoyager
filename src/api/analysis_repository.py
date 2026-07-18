@@ -48,16 +48,16 @@ def _app_connection() -> Any:
         raise HTTPException(status_code=502, detail="Could not reach the application database") from exc
 
 
-def create_analysis_run(connection_id: str, trigger: str) -> str:
+def create_analysis_run(connection_id: str, trigger: str, collection_kind: str = "dashboard") -> str:
     with _app_connection() as connection:
         with connection.cursor() as cursor:
             cursor.execute(
                 """
-                INSERT INTO analysis_runs (monitored_database_id, trigger)
-                VALUES (%s, %s)
+                INSERT INTO analysis_runs (monitored_database_id, trigger, collection_kind)
+                VALUES (%s, %s, %s)
                 RETURNING id
                 """,
-                (connection_id, trigger),
+                (connection_id, trigger, collection_kind),
             )
             return str(cursor.fetchone()[0])
 
@@ -68,13 +68,22 @@ def run_analysis(
     database_name: str,
     connection_provider: ConnectionProvider,
     progress: ProgressCallback | None = None,
+    collection_kind: str = "dashboard",
 ) -> dict[str, Any]:
     _set_running(run_id)
     try:
-        report = build_report(database_name, connection_provider, progress)
+        sections = {
+            "dashboard": {"statistics", "schema", "health_checks"},
+            "statistics": {"statistics"},
+            "slow_queries": {"statistics"},
+            "schema": {"schema"},
+            "health_checks": {"health_checks"},
+            "table_summaries": {"schema"},
+        }[collection_kind]
+        report = build_report(database_name, connection_provider, progress, sections)
         if progress:
             progress("persistence", "Saving analysis results.")
-        _persist_report(run_id, connection_id, report, progress)
+        _persist_report(run_id, connection_id, report, progress, collection_kind)
         if progress:
             progress("persistence", "Analysis results saved.")
         return report
@@ -88,6 +97,7 @@ def run_analysis_in_background(
     connection_id: str,
     database_name: str,
     connection_provider: ConnectionProvider,
+    collection_kind: str = "dashboard",
 ) -> None:
     try:
         _record_progress(run_id, "analysis", "Starting database analysis.")
@@ -97,10 +107,11 @@ def run_analysis_in_background(
             database_name,
             connection_provider,
             lambda stage, message: _record_progress(run_id, stage, message),
+            collection_kind,
         )
         _record_progress(run_id, "analysis", "Analysis report persisted.")
-    except Exception:
-        return
+    except Exception as exc:
+        _record_progress(run_id, "error", f"{type(exc).__name__}: {exc}")
 
 
 def get_latest_report(connection_id: str, auth_subject: str) -> dict[str, Any]:
@@ -114,7 +125,7 @@ def get_latest_report(connection_id: str, auth_subject: str) -> dict[str, Any]:
                 JOIN users ON users.id = databases.owner_user_id
                 WHERE runs.monitored_database_id = %s
                   AND users.auth_subject = %s
-                  AND runs.status = 'succeeded'
+                  AND runs.status = 'succeeded' AND runs.collection_kind = 'dashboard'
                 ORDER BY runs.finished_at DESC
                 LIMIT 1
                 """,
@@ -123,6 +134,23 @@ def get_latest_report(connection_id: str, auth_subject: str) -> dict[str, Any]:
             row = cursor.fetchone()
     if row is None:
         raise HTTPException(status_code=404, detail="No completed dashboard report found")
+    return row[0]
+
+
+def get_latest_collection_report(connection_id: str, auth_subject: str, collection_kind: str) -> dict[str, Any]:
+    with _app_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("""
+                SELECT runs.report_json FROM analysis_runs AS runs
+                JOIN monitored_databases AS databases ON databases.id = runs.monitored_database_id
+                JOIN users ON users.id = databases.owner_user_id
+                WHERE runs.monitored_database_id = %s AND users.auth_subject = %s
+                  AND runs.status = 'succeeded' AND runs.collection_kind = %s
+                ORDER BY runs.finished_at DESC LIMIT 1
+            """, (connection_id, auth_subject, collection_kind))
+            row = cursor.fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"No completed {collection_kind} report found")
     return row[0]
 
 
@@ -176,6 +204,59 @@ def ensure_owned_database(connection_id: str, auth_subject: str) -> None:
                 raise HTTPException(status_code=404, detail="Database not found")
 
 
+def get_latest_slow_queries(connection_id: str, auth_subject: str, limit: int) -> list[dict[str, Any]]:
+    """Return persisted slow queries for one owned database."""
+    with _app_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT snapshots.id, snapshots.query_text, snapshots.calls,
+                       snapshots.total_exec_time_ms, snapshots.mean_exec_time_ms,
+                       snapshots.rows_returned, runs.finished_at
+                FROM query_stat_snapshots AS snapshots
+                JOIN analysis_runs AS runs ON runs.id = snapshots.run_id
+                JOIN monitored_databases AS databases ON databases.id = runs.monitored_database_id
+                JOIN users ON users.id = databases.owner_user_id
+                WHERE runs.monitored_database_id = %s
+                  AND users.auth_subject = %s
+                  AND runs.status = 'succeeded'
+                ORDER BY runs.finished_at DESC, snapshots.total_exec_time_ms DESC
+                LIMIT %s
+                """,
+                (connection_id, auth_subject, limit),
+            )
+            rows = cursor.fetchall()
+    return [
+        {
+            "query_id": str(row[0]), "query": row[1], "calls": row[2],
+            "total_exec_time": row[3], "mean_exec_time": row[4],
+            "rows_returned": row[5], "collected_at": row[6],
+        }
+        for row in rows
+    ]
+
+
+def get_slow_query(connection_id: str, auth_subject: str, query_id: str) -> str:
+    with _app_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT snapshots.query_text
+                FROM query_stat_snapshots AS snapshots
+                JOIN analysis_runs AS runs ON runs.id = snapshots.run_id
+                JOIN monitored_databases AS databases ON databases.id = runs.monitored_database_id
+                JOIN users ON users.id = databases.owner_user_id
+                WHERE snapshots.id = %s AND runs.monitored_database_id = %s
+                  AND users.auth_subject = %s
+                """,
+                (query_id, connection_id, auth_subject),
+            )
+            row = cursor.fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Slow query not found")
+    return str(row[0])
+
+
 def _set_running(run_id: str) -> None:
     with _app_connection() as connection:
         with connection.cursor() as cursor:
@@ -211,19 +292,25 @@ def _persist_report(
     connection_id: str,
     report: dict[str, Any],
     progress: ProgressCallback | None = None,
+    collection_kind: str = "dashboard",
 ) -> None:
     statistics = _ok_data(report, "statistics")
     schema = _ok_data(report, "schema")
     health_checks = _ok_data(report, "health_checks")
     generated_at = report.get("generated_at") or datetime.now(UTC).isoformat()
-    complete = statistics is not None and schema is not None
+    complete = (
+        statistics is not None and schema is not None
+        if collection_kind in {"dashboard", "health_checks"}
+        else (statistics is not None if collection_kind in {"statistics", "slow_queries"} else schema is not None)
+    )
 
     with _app_connection() as connection:
         with connection.cursor() as cursor:
             schema_revision_id = None
             if schema is not None:
                 schema_revision_id = _persist_schema(cursor, run_id, connection_id, schema, report, progress)
-                _persist_table_summaries(cursor, connection_id, run_id, schema_revision_id, schema, progress)
+                if collection_kind in {"dashboard", "table_summaries"}:
+                    _persist_table_summaries(cursor, connection_id, run_id, schema_revision_id, schema, progress)
             if statistics is not None:
                 _persist_statistics(cursor, run_id, connection_id, generated_at, statistics, schema, progress)
             if health_checks is not None:

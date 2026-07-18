@@ -109,3 +109,98 @@ def save_connection(
     except psycopg2.Error as exc:
         detail = exc.diag.message_primary or exc.__class__.__name__
         raise HTTPException(status_code=502, detail=f"Could not save the connection: {detail}") from exc
+
+
+def _app_connection() -> Any:
+    database_url = os.getenv("APP_DATABASE_URL")
+    if not database_url:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="APP_DATABASE_URL is not configured")
+    return psycopg2.connect(database_url, connect_timeout=10)
+
+
+def list_connections(auth_subject: str) -> list[dict[str, Any]]:
+    with _app_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("""
+                SELECT databases.id, databases.display_name, databases.status, databases.last_collected_at,
+                       databases.database_size_mb, databases.num_connections, databases.deleted_at
+                FROM monitored_databases AS databases JOIN users ON users.id = databases.owner_user_id
+                WHERE users.auth_subject = %s AND databases.deleted_at IS NULL
+                ORDER BY databases.updated_at DESC
+            """, (auth_subject,))
+            rows = cursor.fetchall()
+    return [{"connection_id": str(row[0]), "display_name": row[1], "status": row[2],
+             "last_analyzed_at": row[3], "database_size_mb": row[4], "num_connections": row[5],
+             "archived_at": row[6]} for row in rows]
+
+
+def connection_metadata(connection_id: str, auth_subject: str) -> dict[str, Any]:
+    with _app_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("""
+                SELECT databases.id, databases.display_name, databases.status, databases.last_collected_at,
+                       databases.database_size_mb, databases.num_connections, databases.deleted_at
+                FROM monitored_databases AS databases JOIN users ON users.id = databases.owner_user_id
+                WHERE databases.id = %s AND users.auth_subject = %s
+            """, (connection_id, auth_subject))
+            row = cursor.fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Database not found")
+    return {"connection_id": str(row[0]), "display_name": row[1], "status": row[2],
+            "last_analyzed_at": row[3], "database_size_mb": row[4], "num_connections": row[5],
+            "archived_at": row[6]}
+
+
+def rename_connection(connection_id: str, auth_subject: str, display_name: str) -> dict[str, Any]:
+    with _app_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("""
+                UPDATE monitored_databases AS databases SET display_name = %s
+                FROM users WHERE databases.owner_user_id = users.id
+                  AND databases.id = %s AND users.auth_subject = %s AND databases.deleted_at IS NULL
+                RETURNING databases.id
+            """, (display_name, connection_id, auth_subject))
+            if cursor.fetchone() is None:
+                raise HTTPException(status_code=404, detail="Database not found")
+    return connection_metadata(connection_id, auth_subject)
+
+
+def set_archived(connection_id: str, auth_subject: str, archived: bool) -> None:
+    with _app_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("""
+                UPDATE monitored_databases AS databases
+                SET archived_at = CASE WHEN %s THEN now() ELSE NULL END
+                FROM users WHERE databases.owner_user_id = users.id
+                  AND databases.id = %s AND users.auth_subject = %s AND databases.deleted_at IS NULL
+            """, (archived, connection_id, auth_subject))
+            if cursor.rowcount != 1:
+                raise HTTPException(status_code=404, detail="Database not found")
+
+
+def load_connection_credentials(connection_id: str, auth_subject: str) -> dict[str, Any]:
+    """Decrypt the active credential record for its owning user only."""
+    with _app_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("""
+                SELECT credentials.encrypted_data_key, credentials.ciphertext, credentials.nonce, credentials.auth_tag
+                FROM database_credentials AS credentials
+                JOIN monitored_databases AS databases ON databases.id = credentials.monitored_database_id
+                JOIN users ON users.id = databases.owner_user_id
+                WHERE credentials.monitored_database_id = %s AND credentials.is_active
+                  AND databases.deleted_at IS NULL AND users.auth_subject = %s
+            """, (connection_id, auth_subject))
+            row = cursor.fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Database not found")
+    encrypted_data_key, ciphertext, nonce, auth_tag = row
+    try:
+        wrapped = bytes(encrypted_data_key)
+        data_key = AESGCM(_master_key()).decrypt(wrapped[:12], wrapped[12:], connection_id.encode())
+        plaintext = AESGCM(data_key).decrypt(bytes(nonce), bytes(ciphertext) + bytes(auth_tag), connection_id.encode())
+        credentials = json.loads(plaintext)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail="Could not decrypt connection credentials") from exc
+    if not isinstance(credentials, dict):
+        raise HTTPException(status_code=500, detail="Stored connection credentials are invalid")
+    return credentials

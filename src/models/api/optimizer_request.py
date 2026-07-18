@@ -2,7 +2,7 @@ from pydantic import BaseModel #type:ignore
 
 
 class OptimizeQueryRequest(BaseModel):
-    query: str
+    query_id: str
 
 
 class CompareQueryRequest(BaseModel):
