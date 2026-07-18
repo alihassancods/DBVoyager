@@ -4,10 +4,25 @@ from fastapi.testclient import TestClient
 
 from src.api.auth import current_user
 from src.api.main import app
-from src.api.store import _connection_owners, _connections, _credentials, _reports, register_connection
+from src.api.store import _connection_owners, _connections, _credentials, _reports, get_connection, register_connection
 
 
 client = TestClient(app)
+
+
+def test_connection_cache_miss_reloads_encrypted_credentials() -> None:
+    _connections.clear()
+    _credentials.clear()
+    _connection_owners.clear()
+    connection = MagicMock()
+    connection.closed = 0
+
+    with patch("src.api.store.load_connection_credentials", return_value={"database": "demo"}) as load, patch(
+        "src.api.store.psycopg2.connect", return_value=connection
+    ):
+        assert get_connection("connection-1", "owner") is connection
+
+    load.assert_called_once_with("connection-1", "owner")
 
 
 def test_connection_id_is_used_for_query() -> None:
@@ -25,6 +40,7 @@ def test_connection_id_is_used_for_query() -> None:
     try:
         with patch("src.api.connections.psycopg2.connect", return_value=connection), patch(
             "src.api.connections.save_connection", return_value="connection-1"
+        ), patch("src.api.connections.create_collection_schedules"
         ), patch("src.api.connections.create_analysis_run", return_value="run-1"), patch(
             "src.api.connections.run_analysis_in_background"
         ):
@@ -48,7 +64,8 @@ def test_connection_id_is_used_for_query() -> None:
 
     assert response.json() == {
         "connection_id": "connection-1",
-        "analysis_run_id": "run-1",
+        "brief_run_id": "run-1",
+        "deep_analysis_run_id": "run-1",
         "analysis_status": "queued",
     }
     assert result.json() == {"rows": [{"value": 1}], "row_count": 1}
@@ -76,8 +93,12 @@ def test_dashboard_refresh_persists_and_reads_the_latest_report() -> None:
     try:
         with patch("src.api.dashboard.ensure_owned_database"), patch(
             "src.api.dashboard.create_analysis_run", return_value="run-1"
-        ), patch("src.api.dashboard.run_analysis", return_value=report), patch(
+        ), patch("src.api.dashboard.run_analysis_in_background"), patch(
             "src.api.dashboard.get_latest_report", return_value=report
+        ), patch(
+            "src.api.dashboard.get_latest_health_findings", return_value=report["health_checks"]["data"]
+        ), patch(
+            "src.api.dashboard.get_latest_statistics", return_value=report["statistics"]["data"]
         ), patch(
             "src.api.dashboard.get_latest_collection_report", return_value=report
         ), patch(
@@ -91,14 +112,15 @@ def test_dashboard_refresh_persists_and_reads_the_latest_report() -> None:
     finally:
         app.dependency_overrides.clear()
 
-    assert refreshed.json() == report
+    assert refreshed.status_code == 202
+    assert refreshed.json() == {"run_id": "run-1", "resource": "dashboard", "status": "queued"}
     assert run_status.json() == run
     assert health.json()["data"] == report["health_checks"]["data"]
     assert queries.json()["data"] == report["statistics"]["data"]["query_stats"]
     assert diagram.json() == report["schema_visualization"]
 
 
-def test_dashboard_refresh_stream_emits_progress_and_report() -> None:
+def test_dashboard_refresh_stream_emits_progress_and_compact_completion() -> None:
     _connections.clear()
     _credentials.clear()
     _reports.clear()
@@ -130,7 +152,7 @@ def test_dashboard_refresh_stream_emits_progress_and_report() -> None:
 
     assert response.headers["content-type"].startswith("text/event-stream")
     assert 'event: progress\ndata: {"stage": "statistics", "status": "started"}' in events
-    assert 'event: complete\ndata: {"statistics": {"status": "ok", "data": {}}' in events
+    assert 'event: complete\ndata: {"analysis_run_id": "run-1", "status": "succeeded"}' in events
 
 
 def test_analysis_run_stream_emits_terminal_report() -> None:

@@ -30,8 +30,8 @@ def _owner_subject(user: dict[str, object]) -> str:
     return str(user["sub"])
 
 
-def _agent(connection_id: str) -> QueryOptimizerAgent:
-    provider = connection_provider(connection_id)
+def _agent(connection_id: str, owner: str) -> QueryOptimizerAgent:
+    provider = connection_provider(connection_id, owner)
     return QueryOptimizerAgent(
         query_stats_inspector=QueryStatsInspector(provider),
         schema_inspector=SchemaInspector.from_connection_provider(provider),
@@ -43,7 +43,7 @@ def _owned_agent(connection_id: str, user: dict[str, object]) -> QueryOptimizerA
     owner = _owner_subject(user)
     ensure_owned_database(connection_id, owner)
     get_connection(connection_id, owner)
-    return _agent(connection_id)
+    return _agent(connection_id, owner)
 
 
 @router.get("/slow-queries")

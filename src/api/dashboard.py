@@ -4,17 +4,22 @@ import asyncio
 import json
 from typing import Any, Literal
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request, Response, status
 from pydantic import BaseModel, Field
 from fastapi.responses import StreamingResponse
 
 from .analysis_repository import (
+    _record_progress,
     create_analysis_run,
     ensure_owned_database,
     get_analysis_progress,
     get_analysis_run,
+    get_dashboard_summary,
+    get_current_schema,
+    get_latest_health_findings,
     get_latest_collection_report,
     get_latest_report,
+    get_latest_statistics,
     run_analysis,
     run_analysis_in_background,
 )
@@ -23,6 +28,7 @@ from .store import connection_provider, get_connection, get_database_name
 
 
 router = APIRouter(prefix="/connections/{connection_id}")
+SSE_HEADERS = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
 
 
 class FindingStateRequest(BaseModel):
@@ -55,12 +61,12 @@ def _start_manual_run(connection_id: str, user: dict[str, object]) -> tuple[str,
     owner_subject = _owner_subject(user)
     ensure_owned_database(connection_id, owner_subject)
     get_connection(connection_id, owner_subject)
-    return create_analysis_run(connection_id, "manual"), get_database_name(connection_id)
+    return create_analysis_run(connection_id, "manual"), get_database_name(connection_id, owner_subject)
 
 
 def _start_collection_run(
     connection_id: str,
-    resource: Literal["statistics", "slow_queries", "schema", "health_checks", "table_summaries"],
+    resource: Literal["brief", "statistics", "slow_queries", "schema", "health_checks", "table_summaries"],
     background_tasks: BackgroundTasks,
     user: dict[str, object],
 ) -> dict[str, str]:
@@ -72,20 +78,30 @@ def _start_collection_run(
         run_analysis_in_background,
         run_id,
         connection_id,
-        get_database_name(connection_id),
-        connection_provider(connection_id),
+        get_database_name(connection_id, owner_subject),
+        connection_provider(connection_id, owner_subject),
         resource,
     )
     return {"run_id": run_id, "resource": resource, "status": "queued"}
 
 
-@router.post("/dashboard/refresh")
+@router.post("/dashboard/refresh", status_code=status.HTTP_202_ACCEPTED)
 def refresh_dashboard(
     connection_id: str,
+    background_tasks: BackgroundTasks,
     user: dict[str, object] = Depends(current_user),
-) -> dict[str, Any]:
+) -> dict[str, str]:
     run_id, database_name = _start_manual_run(connection_id, user)
-    return run_analysis(run_id, connection_id, database_name, connection_provider(connection_id))
+    background_tasks.add_task(
+        run_analysis_in_background, run_id, connection_id, database_name,
+        connection_provider(connection_id, str(user["sub"])), "dashboard",
+    )
+    return {"run_id": run_id, "resource": "dashboard", "status": "queued"}
+
+
+@router.post("/brief/refresh", status_code=status.HTTP_202_ACCEPTED)
+def refresh_brief(connection_id: str, background_tasks: BackgroundTasks, user: dict[str, object] = Depends(current_user)) -> dict[str, str]:
+    return _start_collection_run(connection_id, "brief", background_tasks, user)
 
 
 @router.post("/statistics/refresh", status_code=status.HTTP_202_ACCEPTED)
@@ -168,13 +184,14 @@ async def analysis_run_stream(
                 yield _sse("progress", event)
             run = await asyncio.to_thread(get_analysis_run, connection_id, run_id, owner_subject)
             if run["status"] in {"succeeded", "failed", "cancelled"}:
-                yield _sse("complete" if run["status"] == "succeeded" else "error", run)
+                event_data = {key: value for key, value in run.items() if key != "report"}
+                yield _sse("complete" if run["status"] == "succeeded" else "error", event_data)
                 return
             if not events:
                 yield _sse("progress", {"stage": "analysis", "message": f"Analysis is {run['status']}."})
             await asyncio.sleep(1)
 
-    return StreamingResponse(stream(), media_type="text/event-stream")
+    return StreamingResponse(stream(), media_type="text/event-stream", headers=SSE_HEADERS)
 
 
 @router.get("/collection-runs/{run_id}/stream")
@@ -196,28 +213,29 @@ async def refresh_dashboard_stream(
     user: dict[str, object] = Depends(current_user),
 ) -> StreamingResponse:
     run_id, database_name = _start_manual_run(connection_id, user)
-    provider = connection_provider(connection_id)
-    loop = asyncio.get_running_loop()
-    updates: asyncio.Queue[dict[str, str]] = asyncio.Queue()
-
-    def progress(stage: str, state: str) -> None:
-        loop.call_soon_threadsafe(updates.put_nowait, {"stage": stage, "status": state})
+    provider = connection_provider(connection_id, str(user["sub"]))
 
     async def stream() -> Any:
-        task = asyncio.create_task(
-            asyncio.to_thread(run_analysis, run_id, connection_id, database_name, provider, progress)
-        )
-        while not task.done() or not updates.empty():
-            try:
-                yield _sse("progress", await asyncio.wait_for(updates.get(), timeout=0.1))
-            except TimeoutError:
-                continue
+        task = asyncio.create_task(asyncio.to_thread(
+            run_analysis, run_id, connection_id, database_name, provider,
+            lambda stage, state: _record_progress(run_id, stage, state),
+        ))
+        offset = 0
+        while not task.done():
+            events, offset = await asyncio.to_thread(get_analysis_progress, run_id, offset)
+            for event in events:
+                yield _sse("progress", {"stage": event["stage"], "status": event["message"]})
+            await asyncio.sleep(0.1)
+        events, offset = await asyncio.to_thread(get_analysis_progress, run_id, offset)
+        for event in events:
+            yield _sse("progress", {"stage": event["stage"], "status": event["message"]})
         try:
-            yield _sse("complete", task.result())
+            task.result()
+            yield _sse("complete", {"analysis_run_id": run_id, "status": "succeeded"})
         except Exception as exc:
             yield _sse("error", {"error": f"{type(exc).__name__}: {exc}"})
 
-    return StreamingResponse(stream(), media_type="text/event-stream")
+    return StreamingResponse(stream(), media_type="text/event-stream", headers=SSE_HEADERS)
 
 
 @router.get("/dashboard")
@@ -229,7 +247,22 @@ def dashboard(
 
 
 @router.get("/overview")
-def overview(connection_id: str, user: dict[str, object] = Depends(current_user)) -> dict[str, Any]:
+def overview(connection_id: str, request: Request, user: dict[str, object] = Depends(current_user)) -> Any:
+    summary = get_dashboard_summary(connection_id, _owner_subject(user))
+    if summary:
+        payload, etag = summary
+        if request.headers.get("if-none-match") == etag:
+            return Response(status_code=status.HTTP_304_NOT_MODIFIED, headers={"ETag": etag})
+        return Response(
+            content=json.dumps(payload, default=str), media_type="application/json",
+            headers={"ETag": etag, "Cache-Control": "private, max-age=15"},
+        )
+    try:
+        brief = get_latest_collection_report(connection_id, _owner_subject(user), "brief")["brief"]["data"]
+        return {"generated_at": None, "health_summary": {severity: sum(item["severity"] == severity for item in brief["insights"]) for severity in ("critical", "warning", "info")}, "database_stats": brief["database_stats"], "top_slow_queries": brief["queries"], "table_count": len(brief["tables"]), "insights": brief["insights"], "query_telemetry_available": brief["query_telemetry_available"]}
+    except HTTPException as exc:
+        if exc.status_code != 404:
+            raise
     report = _report(connection_id, user)
     health = _section(report, "health_checks")
     statistics = _section(report, "statistics")
@@ -245,6 +278,12 @@ def overview(connection_id: str, user: dict[str, object] = Depends(current_user)
     }
 
 
+@router.get("/insights")
+def insights(connection_id: str, limit: int = Query(default=10, ge=1, le=50), user: dict[str, object] = Depends(current_user)) -> dict[str, list[dict[str, Any]]]:
+    report = get_latest_collection_report(connection_id, _owner_subject(user), "brief")
+    return {"data": report["brief"]["data"]["insights"][:limit]}
+
+
 @router.get("/health-checks")
 def health_checks(
     connection_id: str,
@@ -252,11 +291,17 @@ def health_checks(
     check: str | None = Query(default=None),
     user: dict[str, object] = Depends(current_user),
 ) -> dict[str, Any]:
-    section = _section(_collection_report(connection_id, user, "health_checks"), "health_checks")
-    if section["status"] != "ok":
-        return section
+    try:
+        findings = get_latest_health_findings(connection_id, _owner_subject(user))
+    except HTTPException as exc:
+        if exc.status_code != 404:
+            raise
+        section = _section(_collection_report(connection_id, user, "health_checks"), "health_checks")
+        if section["status"] != "ok":
+            return section
+        findings = section["data"]
     data = [
-        finding for finding in section["data"]
+        finding for finding in findings
         if (severity is None or finding["severity"] == severity)
         and (check is None or finding["check"] == check)
     ]
@@ -291,12 +336,24 @@ def statistics(
     connection_id: str,
     user: dict[str, object] = Depends(current_user),
 ) -> dict[str, Any]:
-    return _section(_collection_report(connection_id, user, "statistics"), "statistics")
+    try:
+        return {"status": "ok", "data": get_latest_statistics(connection_id, _owner_subject(user))}
+    except HTTPException as exc:
+        if exc.status_code != 404:
+            raise
+        return _section(_collection_report(connection_id, user, "statistics"), "statistics")
 
 
 def _statistics_group(connection_id: str, name: str, user: dict[str, object]) -> dict[str, Any]:
     section = statistics(connection_id, user)
     return section if section["status"] != "ok" else {"status": "ok", "data": section["data"][name]}
+
+
+def _page(section: dict[str, Any], limit: int, offset: int) -> dict[str, Any]:
+    if section["status"] != "ok":
+        return section
+    data = section["data"]
+    return {"status": "ok", "data": data[offset:offset + limit], "next_offset": offset + limit if len(data) > offset + limit else None}
 
 
 @router.get("/statistics/queries")
@@ -324,25 +381,31 @@ def slow_queries(
 @router.get("/statistics/tables")
 def table_statistics(
     connection_id: str,
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
     user: dict[str, object] = Depends(current_user),
 ) -> dict[str, Any]:
-    return _statistics_group(connection_id, "table_stats", user)
+    return _page(_statistics_group(connection_id, "table_stats", user), limit, offset)
 
 
 @router.get("/statistics/indexes")
 def index_statistics(
     connection_id: str,
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
     user: dict[str, object] = Depends(current_user),
 ) -> dict[str, Any]:
-    return _statistics_group(connection_id, "index_stats", user)
+    return _page(_statistics_group(connection_id, "index_stats", user), limit, offset)
 
 
 @router.get("/statistics/locks")
 def lock_statistics(
     connection_id: str,
+    limit: int = Query(default=50, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
     user: dict[str, object] = Depends(current_user),
 ) -> dict[str, Any]:
-    return _statistics_group(connection_id, "lock_stats", user)
+    return _page(_statistics_group(connection_id, "lock_stats", user), limit, offset)
 
 
 @router.get("/schema")
@@ -350,7 +413,12 @@ def schema(
     connection_id: str,
     user: dict[str, object] = Depends(current_user),
 ) -> dict[str, Any]:
-    return _section(_collection_report(connection_id, user, "schema"), "schema")
+    try:
+        return {"status": "ok", "data": get_current_schema(connection_id, _owner_subject(user))}
+    except HTTPException as exc:
+        if exc.status_code != 404:
+            raise
+        return _section(_collection_report(connection_id, user, "schema"), "schema")
 
 
 @router.get("/schema/diagram")
@@ -359,3 +427,28 @@ def schema_diagram(
     user: dict[str, object] = Depends(current_user),
 ) -> dict[str, Any]:
     return _section(_collection_report(connection_id, user, "schema"), "schema_visualization")
+
+
+@router.get("/schema/visualizer")
+def schema_visualizer(
+    connection_id: str,
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    user: dict[str, object] = Depends(current_user),
+) -> dict[str, Any]:
+    schema_data = schema(connection_id, user)["data"]
+    summaries: dict[tuple[str, str], str] = {}
+    from .analysis_repository import _app_connection
+    with _app_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("""SELECT schema_name, table_name, business_summary FROM database_tables
+                              WHERE monitored_database_id = %s AND removed_at IS NULL AND summary_status = 'ready'""", (connection_id,))
+            summaries = {(row[0], row[1]): row[2] for row in cursor.fetchall()}
+    columns = schema_data.get("columns", [])
+    primary_keys = {(key["table_name"], key["column_name"]) for key in schema_data.get("primary_keys", [])}
+    foreign_keys = schema_data.get("foreign_keys", [])
+    all_tables = schema_data.get("tables", [])
+    tables = all_tables[offset:offset + limit]
+    table_names = {table["table_name"] for table in tables}
+    relationships = [key for key in foreign_keys if key["source_table"] in table_names or key["target_table"] in table_names]
+    return {"data": {"tables": [{"name": table["table_name"], "schema": table["schema_name"], "summary": summaries.get((table["schema_name"], table["table_name"])), "columns": [{**column, "primary_key": (table["table_name"], column["column_name"]) in primary_keys, "foreign_key": any(key["source_table"] == table["table_name"] and key["source_column"] == column["column_name"] for key in relationships)} for column in columns if column["table_name"] == table["table_name"]]} for table in tables], "relationships": relationships}, "next_offset": offset + limit if len(all_tables) > offset + limit else None}

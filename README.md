@@ -97,7 +97,7 @@ Create an account:
 ```bash
 curl -sS -X POST http://127.0.0.1:8000/auth/signup \
   -H 'Content-Type: application/json' \
-  -d '{"name":"Ali","email":"ali@example.com","password":"a-long-password"}' | jq
+  -d '{"name":"Ali","email":"ali@example.com","password":"LongPassword123"}' | jq
 ```
 
 If email verification is enabled in Neon Auth, complete verification before
@@ -108,7 +108,7 @@ shapes.
 ```bash
 TOKEN=$(curl -sS -X POST http://127.0.0.1:8000/auth/login \
   -H 'Content-Type: application/json' \
-  -d '{"email":"ali@example.com","password":"a-long-password"}' \
+  -d '{"email":"ali@example.com","password":"LongPassword123"}' \
   | jq -r '.session.access_token // .data.session.access_token')
 
 test "$TOKEN" != "null" && test -n "$TOKEN"

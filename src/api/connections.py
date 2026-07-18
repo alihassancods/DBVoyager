@@ -1,14 +1,15 @@
 """Connection and ad-hoc query endpoints."""
 
 from typing import Any
+from urllib.parse import parse_qs, unquote, urlsplit
 
 import psycopg2
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
 from psycopg2.extras import RealDictCursor
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from .auth import current_user
-from .analysis_repository import create_analysis_run, run_analysis_in_background
+from .analysis_repository import create_analysis_run, create_collection_schedules, run_analysis_in_background
 from .connection_repository import connection_metadata, list_connections, load_connection_credentials, rename_connection, save_connection, set_archived
 from .store import _connections, _connection_owners, _credentials, _lock, _reports, connection_provider, get_connection, register_connection
 from src.agent.business_intelligence.validator import SQLValidator
@@ -19,12 +20,38 @@ router = APIRouter()
 
 class DatabaseCredentials(BaseModel):
     display_name: str | None = Field(default=None, min_length=1, max_length=200)
-    host: str = Field(min_length=1)
-    port: int = Field(default=5432, ge=1, le=65535)
-    database: str = Field(min_length=1)
-    user: str = Field(min_length=1)
-    password: str
+    connection_url: str | None = Field(default=None, min_length=1, max_length=2_000)
+    host: str | None = Field(default=None, min_length=1)
+    port: int | None = Field(default=None, ge=1, le=65535)
+    database: str | None = Field(default=None, min_length=1)
+    user: str | None = Field(default=None, min_length=1)
+    password: str | None = None
     sslmode: str = "require"
+
+    @field_validator("display_name", mode="before")
+    @classmethod
+    def blank_display_name_is_none(cls, value: object) -> object:
+        return None if isinstance(value, str) and not value.strip() else value
+
+    @model_validator(mode="after")
+    def normalize_connection_url(self) -> "DatabaseCredentials":
+        if self.connection_url:
+            parsed = urlsplit(self.connection_url.strip())
+            if parsed.scheme not in {"postgres", "postgresql"} or not parsed.hostname or not parsed.username or parsed.password is None or not parsed.path.strip("/") or parsed.fragment:
+                raise ValueError("Enter a complete postgresql://user:password@host:port/database URL")
+            self.host = parsed.hostname
+            self.port = parsed.port or 5432
+            self.database = unquote(parsed.path.strip("/"))
+            self.user = unquote(parsed.username)
+            self.password = unquote(parsed.password)
+            self.sslmode = parse_qs(parsed.query).get("sslmode", [self.sslmode])[0]
+        self.port = self.port or 5432
+        if not all((self.host, self.port, self.database, self.user, self.password)):
+            raise ValueError("Provide a complete PostgreSQL connection URL")
+        return self
+
+    def connection_options(self) -> dict[str, object]:
+        return self.model_dump(exclude={"display_name", "connection_url"}, exclude_none=True)
 
 
 class QueryRequest(BaseModel):
@@ -38,6 +65,14 @@ class ConnectionUpdateRequest(BaseModel):
 
 class ScopedQueryRequest(BaseModel):
     query: str = Field(min_length=1)
+
+
+def _test_credentials(credentials: DatabaseCredentials) -> None:
+    try:
+        connection = psycopg2.connect(**credentials.connection_options(), connect_timeout=10)
+    except psycopg2.Error as exc:
+        raise HTTPException(status_code=400, detail="Could not connect to database") from exc
+    connection.close()
 
 
 @router.get("/connections")
@@ -83,12 +118,16 @@ def test_connection(
 ) -> dict[str, str]:
     """Validate supplied credentials without persisting them."""
     connection_metadata(connection_id, str(user["sub"]))
-    connection_data = credentials.model_dump(exclude={"display_name"})
-    try:
-        connection = psycopg2.connect(**connection_data, connect_timeout=10)
-    except psycopg2.Error as exc:
-        raise HTTPException(status_code=400, detail="Could not connect to database") from exc
-    connection.close()
+    _test_credentials(credentials)
+    return {"status": "ok"}
+
+
+@router.post("/connections/test")
+def test_new_connection(
+    credentials: DatabaseCredentials, user: dict[str, object] = Depends(current_user)
+) -> dict[str, str]:
+    """Validate new credentials before they are persisted."""
+    _test_credentials(credentials)
     return {"status": "ok"}
 
 
@@ -105,7 +144,7 @@ def create_connection(
     background_tasks: BackgroundTasks,
     user: dict[str, object] = Depends(current_user),
 ) -> dict[str, str]:
-    connection_data = credentials.model_dump(exclude={"display_name"})
+    connection_data = credentials.connection_options()
     try:
         connection = psycopg2.connect(**connection_data, connect_timeout=10)
     except psycopg2.Error as exc:
@@ -122,15 +161,25 @@ def create_connection(
         connection.close()
         raise
     register_connection(connection_id, str(user["sub"]), connection, connection_data)
-    run_id = create_analysis_run(connection_id, "initial")
+    create_collection_schedules(connection_id)
+    brief_run_id = create_analysis_run(connection_id, "initial", "brief")
+    deep_run_id = create_analysis_run(connection_id, "initial")
     background_tasks.add_task(
         run_analysis_in_background,
-        run_id,
+        brief_run_id,
         connection_id,
         connection_data["database"],
-        connection_provider(connection_id),
+        connection_provider(connection_id, str(user["sub"])),
+        "brief",
     )
-    return {"connection_id": connection_id, "analysis_run_id": run_id, "analysis_status": "queued"}
+    background_tasks.add_task(
+        run_analysis_in_background,
+        deep_run_id,
+        connection_id,
+        connection_data["database"],
+        connection_provider(connection_id, str(user["sub"])),
+    )
+    return {"connection_id": connection_id, "brief_run_id": brief_run_id, "deep_analysis_run_id": deep_run_id, "analysis_status": "queued"}
 
 
 @router.delete("/connections/{connection_id}", status_code=status.HTTP_204_NO_CONTENT)

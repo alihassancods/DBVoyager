@@ -57,6 +57,7 @@ class KPIAggregateExecutor:
                 points = [dict(zip(names, row, strict=True)) for row in cursor.fetchall()]
             return KPISnapshot(
                 kpi_definition_id=definition.id,
+                monitored_database_id=definition.monitored_database_id,
                 analysis_run_id=analysis_run_id,
                 sql=sql,
                 points=points,

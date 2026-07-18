@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 from functools import lru_cache
 from urllib.parse import urlsplit
 
@@ -13,12 +14,13 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import JSONResponse, Response
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jwt import PyJWKClient
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 bearer_scheme = HTTPBearer(auto_error=False)
 load_dotenv()
+PASSWORD_MESSAGE = "Password must be at least 8 characters and include uppercase, lowercase, and a number"
 
 
 class SignUpRequest(BaseModel):
@@ -26,10 +28,40 @@ class SignUpRequest(BaseModel):
     email: str = Field(min_length=3, max_length=320)
     password: str = Field(min_length=8, max_length=256)
 
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, value: str) -> str:
+        if not (name := value.strip()):
+            raise ValueError("Name cannot be blank")
+        return name
+
+    @field_validator("email")
+    @classmethod
+    def normalize_email(cls, value: str) -> str:
+        email = value.strip().lower()
+        if not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", email):
+            raise ValueError("Enter a valid email address")
+        return email
+
+    @field_validator("password")
+    @classmethod
+    def validate_password(cls, value: str) -> str:
+        if not all((re.search(r"[a-z]", value), re.search(r"[A-Z]", value), re.search(r"\d", value))):
+            raise ValueError(PASSWORD_MESSAGE)
+        return value
+
 
 class LoginRequest(BaseModel):
     email: str = Field(min_length=3, max_length=320)
-    password: str = Field(min_length=8, max_length=256)
+    password: str = Field(min_length=1, max_length=256)
+
+    @field_validator("email")
+    @classmethod
+    def normalize_email(cls, value: str) -> str:
+        email = value.strip().lower()
+        if not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", email):
+            raise ValueError("Enter a valid email address")
+        return email
 
 
 def neon_auth_base_url() -> str:
@@ -97,14 +129,16 @@ async def neon_request(
     except httpx.RequestError as exc:
         raise HTTPException(status_code=502, detail="Neon Auth is unavailable") from exc
 
-    response_headers = {
-        name: value
-        for name in ("set-cookie", "set-auth-jwt")
-        if (value := upstream.headers.get(name))
-    }
+    response_headers = {"cache-control": "no-store"}
+    if value := upstream.headers.get("set-auth-jwt"):
+        response_headers["set-auth-jwt"] = value
     if "application/json" not in upstream.headers.get("content-type", ""):
-        return Response(upstream.content, status_code=upstream.status_code, headers=response_headers)
-    return JSONResponse(upstream.json(), status_code=upstream.status_code, headers=response_headers)
+        response = Response(upstream.content, status_code=upstream.status_code, headers=response_headers)
+    else:
+        response = JSONResponse(upstream.json(), status_code=upstream.status_code, headers=response_headers)
+    for cookie in upstream.headers.get_list("set-cookie"):
+        response.headers.append("set-cookie", cookie)
+    return response
 
 
 @router.post("/signup", status_code=status.HTTP_201_CREATED)
@@ -119,7 +153,7 @@ async def login(payload: LoginRequest, request: Request) -> Response:
 
 @router.post("/logout", status_code=status.HTTP_204_NO_CONTENT)
 async def logout(request: Request) -> Response:
-    response = await neon_request(request, "sign-out")
+    response = await neon_request(request, "sign-out", {})
     if response.status_code >= 400:
         return response
     return Response(status_code=status.HTTP_204_NO_CONTENT, headers=dict(response.headers))

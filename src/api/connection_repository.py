@@ -178,19 +178,7 @@ def set_archived(connection_id: str, auth_subject: str, archived: bool) -> None:
                 raise HTTPException(status_code=404, detail="Database not found")
 
 
-def load_connection_credentials(connection_id: str, auth_subject: str) -> dict[str, Any]:
-    """Decrypt the active credential record for its owning user only."""
-    with _app_connection() as connection:
-        with connection.cursor() as cursor:
-            cursor.execute("""
-                SELECT credentials.encrypted_data_key, credentials.ciphertext, credentials.nonce, credentials.auth_tag
-                FROM database_credentials AS credentials
-                JOIN monitored_databases AS databases ON databases.id = credentials.monitored_database_id
-                JOIN users ON users.id = databases.owner_user_id
-                WHERE credentials.monitored_database_id = %s AND credentials.is_active
-                  AND databases.deleted_at IS NULL AND users.auth_subject = %s
-            """, (connection_id, auth_subject))
-            row = cursor.fetchone()
+def _decode_credentials(connection_id: str, row: tuple[Any, ...] | None) -> dict[str, Any]:
     if row is None:
         raise HTTPException(status_code=404, detail="Database not found")
     encrypted_data_key, ciphertext, nonce, auth_tag = row
@@ -204,3 +192,33 @@ def load_connection_credentials(connection_id: str, auth_subject: str) -> dict[s
     if not isinstance(credentials, dict):
         raise HTTPException(status_code=500, detail="Stored connection credentials are invalid")
     return credentials
+
+
+def load_connection_credentials(connection_id: str, auth_subject: str) -> dict[str, Any]:
+    """Decrypt the active credential record for its owning user only."""
+    with _app_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("""
+                SELECT credentials.encrypted_data_key, credentials.ciphertext, credentials.nonce, credentials.auth_tag
+                FROM database_credentials AS credentials
+                JOIN monitored_databases AS databases ON databases.id = credentials.monitored_database_id
+                JOIN users ON users.id = databases.owner_user_id
+                WHERE credentials.monitored_database_id = %s AND credentials.is_active
+                  AND databases.deleted_at IS NULL AND users.auth_subject = %s
+            """, (connection_id, auth_subject))
+            row = cursor.fetchone()
+    return _decode_credentials(connection_id, row)
+
+
+def load_worker_connection_credentials(connection_id: str) -> dict[str, Any]:
+    """Internal worker-only credential access after the scheduler has claimed a run."""
+    with _app_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """SELECT encrypted_data_key, ciphertext, nonce, auth_tag
+                   FROM database_credentials
+                   WHERE monitored_database_id = %s AND is_active""",
+                (connection_id,),
+            )
+            row = cursor.fetchone()
+    return _decode_credentials(connection_id, row)

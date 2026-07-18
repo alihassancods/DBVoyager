@@ -10,7 +10,8 @@ SELECT
     mean_exec_time,
     rows AS rows_returned
 FROM pg_stat_statements
-ORDER BY total_exec_time DESC;
+ORDER BY total_exec_time DESC
+LIMIT 100;
 """
 
 #======================================Table Statistics============================================
@@ -23,7 +24,8 @@ SELECT
     n_live_tup,
     n_dead_tup
 FROM pg_stat_user_tables
-ORDER BY seq_scan DESC;
+ORDER BY seq_scan DESC
+LIMIT 200;
 """
 
 #======================================Index Statistics============================================
@@ -40,7 +42,8 @@ JOIN pg_class AS tables
     ON tables.oid = stats.relid
 JOIN pg_class AS indexes
     ON indexes.oid = stats.indexrelid
-ORDER BY stats.idx_scan DESC;
+ORDER BY stats.idx_scan DESC
+LIMIT 200;
 """
 # pg_stat_user_indexes AS stats: This is the main system logbook. It tracks the raw index statistics, but only uses ID numbers (like "Index ID 16402 belongs to Table ID 16398").
 
@@ -58,7 +61,8 @@ SELECT
     granted,
     relation::regclass::text AS relation
 FROM pg_locks
-ORDER BY granted ASC;
+ORDER BY granted ASC
+LIMIT 100;
 """
 
 #======================================Database Size Statistics============================================

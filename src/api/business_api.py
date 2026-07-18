@@ -39,7 +39,7 @@ def investigate_business_question(
     get_connection(connection_id, owner)
     try:
         result = BusinessIntelligenceOrchestrator(
-            connection_provider=connection_provider(connection_id)
+            connection_provider=connection_provider(connection_id, owner)
         ).investigate(question=request.question)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

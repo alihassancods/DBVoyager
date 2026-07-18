@@ -14,7 +14,7 @@ def test_table_summaries_are_saved_and_streamed(monkeypatch) -> None:
             self.calls.append((query, params))
 
         def fetchone(self):
-            return ("table-1",)
+            return ("table-1", "pending")
 
     monkeypatch.setattr(analysis_repository, "TableBusinessSummaryAgent", Agent)
     cursor = Cursor()
