@@ -21,7 +21,7 @@ from typing import Any
 
 from src.agent.business_intelligence.analysis_agent import AnalysisAgent
 from src.agent.business_intelligence.planner_agent import PlannerAgent
-from src.agent.business_intelligence.sql_generation_agent import SQLGenerationAgent
+from sql_generation_agent import SQLGenerationAgent
 
 from src.models.business_intelligence.investigation_plan import (
     InvestigationPlan,
@@ -45,6 +45,15 @@ from src.db_engine.inspectors.schema_inspector import (
 
 from src.agent.business_intelligence.schema_validator import (
     SchemaValidator,
+)
+
+import time
+
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning, module="openai" )
+
+from src.db_engine.inspectors.statistics.statistics_inspector import (
+    StatisticsInspector,
 )
 
 class BusinessIntelligenceOrchestrator:
@@ -125,64 +134,102 @@ class BusinessIntelligenceOrchestrator:
 
         # Use SchemaInspector to fetch reality from the database connection
         # if no testing schema context is explicitly provided.
-        if not schema_context or schema_context.strip() == "":
-            schema_context = (
-                SchemaInspector.from_connection_provider(
-                    self._connection_provider
-                ).inspect()
+        if not schema_context:
+          start = time.perf_counter()
+
+          schema_context = ( 
+              SchemaInspector.from_connection_provider( #type: ignore
+                  self._connection_provider
+              ).inspect()
             )
+
+          print(
+          f"Schema Inspector took "
+          f"{time.perf_counter() - start:.2f}s"
+        )
 
         # -----------------------------------
         # Phase 1: Planning
         # -----------------------------------
+        start = time.perf_counter()
         plan = self._create_plan(
             question=question,
-            schema_context=schema_context,
+            schema_context=schema_context, #type: ignore
         )
 
+        print(
+         f"Planning took "
+         f"{time.perf_counter() - start:.2f}s"
+        )
         # -----------------------------------
         # Phase 2: SQL Generation
-        # -----------------------------------
+        # ----------------------------------
+        start = time.perf_counter()
         sql_request = self._generate_sql(
             question=question,
             plan=plan,
-            schema_context=schema_context,
+            schema_context=schema_context,#type: ignore
         )
 
         self._schema_validator.validate(
             sql_request.sql,
-            schema_context,
+            schema_context,#type: ignore
         )
-
+        
+        print(
+        f"SQL Generation took "
+        f"{time.perf_counter() - start:.2f}s"
+        )
         # -----------------------------------
         # Phase 3: Validation
         # -----------------------------------
+        start = time.perf_counter()
         self._validate_sql(
             sql_request.sql,
         )
 
+        print(
+         f"SQL validation took "
+        f"{time.perf_counter() - start:.2f}s"
+        )
         # -----------------------------------
         # Phase 4: Execution
         # -----------------------------------
+        start = time.perf_counter()
         sql_result = self._execute_sql(
             sql_request,
         )
 
+        print(
+         f"SQL Execution took "
+        f"{time.perf_counter() - start:.2f}s"
+        )
         # -----------------------------------
         # Phase 5: Analysis
         # -----------------------------------
+        start = time.perf_counter()
         insight = self._analyze(
             question=question,
             plan=plan,
             sql_result=sql_result,
         )
 
+        print(
+         f"Analysis took "
+        f"{time.perf_counter() - start:.2f}s"
+        )
         # -----------------------------------
         # Phase 6: Charts
         # -----------------------------------
+        start = time.perf_counter()
         charts = self._generate_charts(
             sql_result,
         )
+        
+        print(
+     f"chart generation took "
+    f"{time.perf_counter() - start:.2f}s"
+)
 
         self._logger.info(
             "Investigation completed successfully."
@@ -197,6 +244,7 @@ class BusinessIntelligenceOrchestrator:
             "insight": insight,
             "charts": charts,
         }
+
 
     # ==========================================================
     # INTERNAL METHODS

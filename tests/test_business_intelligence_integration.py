@@ -23,7 +23,7 @@ def test_business_question() -> None:
     )
 
     result = orchestrator.investigate(
-    question="Show monthly revenue, order count, and customer count.",
+    question="Which product category generates the highest revenue?",
 )
 
     print("\n")

@@ -4,7 +4,7 @@ from src.agent.business_intelligence.prompts import PLANNER_PROMPT
 from src.models.business_intelligence.investigation_plan import (
     InvestigationPlan,
 )
-
+import time
 
 class PlannerAgent:
     """
@@ -25,8 +25,13 @@ class PlannerAgent:
             schema=schema_context,
         )
 
+        start = time.perf_counter()
         response = self._llm.invoke(prompt)
+        print(
+    f"Planner LLM took "
+    f"{time.perf_counter() - start:.2f}s"
+)
 
         return InvestigationPlan.model_validate_json(
-            response.content
+            response.content #type: ignore
         )
