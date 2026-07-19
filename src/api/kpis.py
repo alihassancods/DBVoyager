@@ -7,7 +7,7 @@ import json
 from collections import defaultdict
 from typing import Any, Literal
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request, Response, status
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -15,6 +15,7 @@ from src.agent.kpi import KPIAggregateExecutor, KPIDiscoveryAgent, KPIDiscoveryU
 
 from .analysis_repository import ensure_owned_database
 from .auth import current_user
+from .resource_cache import cached_json, invalidate
 from .store import connection_provider, get_connection
 
 
@@ -65,6 +66,7 @@ def generate_dashboard_kpis(
         )
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)) from exc
     repository.set_generation_status(connection_id, "running")
+    invalidate(connection_id, "kpis/dashboard")
     background_tasks.add_task(generate_kpis, connection_id, connection_provider(connection_id, owner))
     return {"status": "queued"}
 
@@ -178,6 +180,7 @@ def approve_candidate(
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"KPI execution failed: {type(exc).__name__}") from exc
+    invalidate(connection_id, "kpis/dashboard", f"kpis/chart:{definition.id}")
     return {"definition": definition.model_dump(), "chart": _chart(definition, {
         "analysis_run_id": snapshot.analysis_run_id,
         "points": snapshot.points,
@@ -212,16 +215,17 @@ def list_definitions(
 @router.get("/dashboard")
 def kpi_dashboard(
     connection_id: str,
+    request: Request,
     user: dict[str, object] = Depends(current_user),
     repository: KPIRepository = Depends(get_kpi_repository),
-) -> dict[str, object]:
+) -> Response:
     _ensure_owned(connection_id, user)
     snapshots = repository.latest_snapshots(connection_id)
     data = []
     for definition in repository.list_definitions(connection_id):
         snapshot = snapshots.get(definition.id)
         data.append({**definition.model_dump(), "chart": _chart(definition, snapshot) if snapshot else None})
-    return {"data": data, "generation": repository.generation_status(connection_id)}
+    return cached_json(request, connection_id, "kpis/dashboard", {"data": data, "generation": repository.generation_status(connection_id)})
 
 
 @router.post("/definitions/{definition_id}/refresh")
@@ -244,6 +248,7 @@ def refresh_definition(
         repository.save_snapshot(snapshot)
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"KPI execution failed: {type(exc).__name__}") from exc
+    invalidate(connection_id, "kpis/dashboard", f"kpis/chart:{definition_id}")
     return _chart(definition, {
         "analysis_run_id": snapshot.analysis_run_id,
         "points": snapshot.points,
@@ -256,9 +261,10 @@ def refresh_definition(
 def latest_chart(
     connection_id: str,
     definition_id: str,
+    request: Request,
     user: dict[str, object] = Depends(current_user),
     repository: KPIRepository = Depends(get_kpi_repository),
-) -> dict[str, object]:
+) -> Response:
     _ensure_owned(connection_id, user)
     definition = repository.get_definition(definition_id, connection_id)
     if definition is None:
@@ -266,4 +272,4 @@ def latest_chart(
     snapshot = repository.latest_snapshot(definition_id, connection_id)
     if snapshot is None:
         raise HTTPException(status_code=404, detail="No KPI snapshot found")
-    return _chart(definition, snapshot)
+    return cached_json(request, connection_id, f"kpis/chart:{definition_id}", _chart(definition, snapshot))

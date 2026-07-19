@@ -5,8 +5,10 @@ import json
 from typing import Any, Literal
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request, Response, status
+from psycopg2 import sql
+from psycopg2.extras import RealDictCursor
 from pydantic import BaseModel, Field
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from .analysis_repository import (
     _record_progress,
@@ -20,11 +22,15 @@ from .analysis_repository import (
     get_latest_collection_report,
     get_latest_report,
     get_latest_statistics,
+    collect_analysis,
+    persist_collected_analysis,
     run_analysis,
     run_analysis_in_background,
 )
 from .auth import current_user
 from .store import connection_provider, get_connection, get_database_name
+from .resource_cache import cached_json, invalidate
+from .resource_cache import publish_preview, read_preview
 
 
 router = APIRouter(prefix="/connections/{connection_id}")
@@ -181,6 +187,9 @@ async def analysis_run_stream(
         while True:
             events, offset = get_analysis_progress(run_id, offset)
             for event in events:
+                if event["stage"] == "data_ready" and read_preview(connection_id, run_id) is not None:
+                    yield _sse("data_ready", {"analysis_run_id": run_id, "preview": f"/connections/{connection_id}/collection-runs/{run_id}/preview"})
+                    return
                 yield _sse("progress", event)
             run = await asyncio.to_thread(get_analysis_run, connection_id, run_id, owner_subject)
             if run["status"] in {"succeeded", "failed", "cancelled"}:
@@ -217,7 +226,7 @@ async def refresh_dashboard_stream(
 
     async def stream() -> Any:
         task = asyncio.create_task(asyncio.to_thread(
-            run_analysis, run_id, connection_id, database_name, provider,
+            collect_analysis, run_id, connection_id, database_name, provider,
             lambda stage, state: _record_progress(run_id, stage, state),
         ))
         offset = 0
@@ -230,12 +239,26 @@ async def refresh_dashboard_stream(
         for event in events:
             yield _sse("progress", {"stage": event["stage"], "status": event["message"]})
         try:
-            task.result()
-            yield _sse("complete", {"analysis_run_id": run_id, "status": "succeeded"})
+            report = task.result()
+            if publish_preview(connection_id, run_id, "dashboard", report):
+                _record_progress(run_id, "data_ready", "Collected data is ready for the dashboard.")
+                yield _sse("data_ready", {"analysis_run_id": run_id, "preview": f"/connections/{connection_id}/collection-runs/{run_id}/preview"})
+            else:
+                await asyncio.to_thread(persist_collected_analysis, run_id, connection_id, report, "dashboard")
+                yield _sse("complete", {"analysis_run_id": run_id, "status": "succeeded"})
         except Exception as exc:
             yield _sse("error", {"error": f"{type(exc).__name__}: {exc}"})
 
     return StreamingResponse(stream(), media_type="text/event-stream", headers=SSE_HEADERS)
+
+
+@router.get("/collection-runs/{run_id}/preview")
+def collection_preview(connection_id: str, run_id: str, user: dict[str, object] = Depends(current_user)) -> dict[str, Any]:
+    ensure_owned_database(connection_id, _owner_subject(user))
+    report = read_preview(connection_id, run_id)
+    if report is None:
+        raise HTTPException(status_code=404, detail="Live collection preview is unavailable")
+    return {"analysis_run_id": run_id, "report": report}
 
 
 @router.get("/dashboard")
@@ -250,20 +273,20 @@ def dashboard(
 def overview(connection_id: str, request: Request, user: dict[str, object] = Depends(current_user)) -> Any:
     summary = get_dashboard_summary(connection_id, _owner_subject(user))
     if summary:
-        payload, etag = summary
-        if request.headers.get("if-none-match") == etag:
-            return Response(status_code=status.HTTP_304_NOT_MODIFIED, headers={"ETag": etag})
-        return Response(
-            content=json.dumps(payload, default=str), media_type="application/json",
-            headers={"ETag": etag, "Cache-Control": "private, max-age=15"},
-        )
+        payload, _ = summary
+        return cached_json(request, connection_id, "overview", payload)
     try:
         brief = get_latest_collection_report(connection_id, _owner_subject(user), "brief")["brief"]["data"]
         return {"generated_at": None, "health_summary": {severity: sum(item["severity"] == severity for item in brief["insights"]) for severity in ("critical", "warning", "info")}, "database_stats": brief["database_stats"], "top_slow_queries": brief["queries"], "table_count": len(brief["tables"]), "insights": brief["insights"], "query_telemetry_available": brief["query_telemetry_available"]}
     except HTTPException as exc:
         if exc.status_code != 404:
             raise
-    report = _report(connection_id, user)
+    try:
+        report = _report(connection_id, user)
+    except HTTPException as exc:
+        if exc.status_code != 404:
+            raise
+        return JSONResponse(status_code=status.HTTP_202_ACCEPTED, content={"collection_status": "collecting"})
     health = _section(report, "health_checks")
     statistics = _section(report, "statistics")
     findings = health.get("data", []) if health.get("status") == "ok" else []
@@ -279,24 +302,30 @@ def overview(connection_id: str, request: Request, user: dict[str, object] = Dep
 
 
 @router.get("/insights")
-def insights(connection_id: str, limit: int = Query(default=10, ge=1, le=50), user: dict[str, object] = Depends(current_user)) -> dict[str, list[dict[str, Any]]]:
+def insights(connection_id: str, request: Request, limit: int = Query(default=10, ge=1, le=50), user: dict[str, object] = Depends(current_user)) -> Response:
     report = get_latest_collection_report(connection_id, _owner_subject(user), "brief")
-    return {"data": report["brief"]["data"]["insights"][:limit]}
+    return cached_json(request, connection_id, f"insights:{limit}", {"data": report["brief"]["data"]["insights"][:limit]})
 
 
 @router.get("/health-checks")
 def health_checks(
     connection_id: str,
+    request: Request,
     severity: str | None = None,
     check: str | None = Query(default=None),
     user: dict[str, object] = Depends(current_user),
-) -> dict[str, Any]:
+) -> Response:
     try:
         findings = get_latest_health_findings(connection_id, _owner_subject(user))
     except HTTPException as exc:
         if exc.status_code != 404:
             raise
-        section = _section(_collection_report(connection_id, user, "health_checks"), "health_checks")
+        try:
+            section = _section(_collection_report(connection_id, user, "health_checks"), "health_checks")
+        except HTTPException as missing:
+            if missing.status_code != 404:
+                raise
+            return JSONResponse(status_code=status.HTTP_202_ACCEPTED, content={"status": "collecting", "data": []})
         if section["status"] != "ok":
             return section
         findings = section["data"]
@@ -305,7 +334,8 @@ def health_checks(
         if (severity is None or finding["severity"] == severity)
         and (check is None or finding["check"] == check)
     ]
-    return {"status": "ok", "data": data}
+    resource = "health-checks" if severity is None and check is None else f"health-checks:{severity or 'all'}:{check or 'all'}"
+    return cached_json(request, connection_id, resource, {"status": "ok", "data": data})
 
 
 @router.patch("/health-checks/{finding_id}")
@@ -328,6 +358,7 @@ def update_health_finding(
             """, (payload.user_state, payload.user_note, finding_id, connection_id, owner))
             if cursor.rowcount != 1:
                 raise HTTPException(status_code=404, detail="Health finding not found")
+    invalidate(connection_id, "health-checks", "overview", "insights:10")
     return {"finding_id": finding_id, "user_state": payload.user_state}
 
 
@@ -341,12 +372,17 @@ def statistics(
     except HTTPException as exc:
         if exc.status_code != 404:
             raise
-        return _section(_collection_report(connection_id, user, "statistics"), "statistics")
+        try:
+            return _section(_collection_report(connection_id, user, "statistics"), "statistics")
+        except HTTPException as missing:
+            if missing.status_code != 404:
+                raise
+            return {"status": "collecting", "data": {"query_stats": [], "table_stats": [], "index_stats": [], "lock_stats": [], "database_stats": {}}}
 
 
 def _statistics_group(connection_id: str, name: str, user: dict[str, object]) -> dict[str, Any]:
     section = statistics(connection_id, user)
-    return section if section["status"] != "ok" else {"status": "ok", "data": section["data"][name]}
+    return {"status": section["status"], "data": section["data"][name]}
 
 
 def _page(section: dict[str, Any], limit: int, offset: int) -> dict[str, Any]:
@@ -372,10 +408,11 @@ def query_statistics(
 @router.get("/slow-queries")
 def slow_queries(
     connection_id: str,
+    request: Request,
     limit: int = Query(default=20, ge=1, le=100),
     user: dict[str, object] = Depends(current_user),
-) -> dict[str, Any]:
-    return query_statistics(connection_id, "total_exec_time", limit, user)
+) -> Response:
+    return cached_json(request, connection_id, f"slow-queries:{limit}", query_statistics(connection_id, "total_exec_time", limit, user))
 
 
 @router.get("/statistics/tables")
@@ -408,8 +445,7 @@ def lock_statistics(
     return _page(_statistics_group(connection_id, "lock_stats", user), limit, offset)
 
 
-@router.get("/schema")
-def schema(
+def _schema_payload(
     connection_id: str,
     user: dict[str, object] = Depends(current_user),
 ) -> dict[str, Any]:
@@ -418,7 +454,21 @@ def schema(
     except HTTPException as exc:
         if exc.status_code != 404:
             raise
-        return _section(_collection_report(connection_id, user, "schema"), "schema")
+        try:
+            return _section(_collection_report(connection_id, user, "schema"), "schema")
+        except HTTPException as missing:
+            if missing.status_code != 404:
+                raise
+            return {"status": "collecting", "data": {"tables": [], "columns": [], "primary_keys": [], "foreign_keys": [], "indexes": [], "relations": []}}
+
+
+@router.get("/schema")
+def schema(
+    connection_id: str,
+    request: Request,
+    user: dict[str, object] = Depends(current_user),
+) -> Response:
+    return cached_json(request, connection_id, "schema", _schema_payload(connection_id, user))
 
 
 @router.get("/schema/diagram")
@@ -426,17 +476,23 @@ def schema_diagram(
     connection_id: str,
     user: dict[str, object] = Depends(current_user),
 ) -> dict[str, Any]:
-    return _section(_collection_report(connection_id, user, "schema"), "schema_visualization")
+    try:
+        return _section(_collection_report(connection_id, user, "schema"), "schema_visualization")
+    except HTTPException as exc:
+        if exc.status_code != 404:
+            raise
+        return {"status": "collecting", "data": ""}
 
 
 @router.get("/schema/visualizer")
 def schema_visualizer(
     connection_id: str,
+    request: Request,
     limit: int = Query(default=50, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
     user: dict[str, object] = Depends(current_user),
-) -> dict[str, Any]:
-    schema_data = schema(connection_id, user)["data"]
+) -> Response:
+    schema_data = _schema_payload(connection_id, user)["data"]
     summaries: dict[tuple[str, str], str] = {}
     from .analysis_repository import _app_connection
     with _app_connection() as connection:
@@ -451,4 +507,70 @@ def schema_visualizer(
     tables = all_tables[offset:offset + limit]
     table_names = {table["table_name"] for table in tables}
     relationships = [key for key in foreign_keys if key["source_table"] in table_names or key["target_table"] in table_names]
-    return {"data": {"tables": [{"name": table["table_name"], "schema": table["schema_name"], "summary": summaries.get((table["schema_name"], table["table_name"])), "columns": [{**column, "primary_key": (table["table_name"], column["column_name"]) in primary_keys, "foreign_key": any(key["source_table"] == table["table_name"] and key["source_column"] == column["column_name"] for key in relationships)} for column in columns if column["table_name"] == table["table_name"]]} for table in tables], "relationships": relationships}, "next_offset": offset + limit if len(all_tables) > offset + limit else None}
+    indexes = schema_data.get("indexes", [])
+    return cached_json(request, connection_id, f"schema/visualizer:{limit}:{offset}", {"data": {"tables": [{"name": table["table_name"], "schema": table["schema_name"], "table_type": table["table_type"], "estimated_rows": table.get("estimated_rows"), "summary": summaries.get((table["schema_name"], table["table_name"])), "columns": [{**column, "primary_key": (table["table_name"], column["column_name"]) in primary_keys, "foreign_key": any(key["source_table"] == table["table_name"] and key["source_column"] == column["column_name"] for key in relationships)} for column in columns if column["table_name"] == table["table_name"]], "indexes": [index for index in indexes if index["table_name"] == table["table_name"]]} for table in tables], "relationships": relationships}, "next_offset": offset + limit if len(all_tables) > offset + limit else None})
+
+
+def _owned_schema_table(connection_id: str, owner: str, schema_name: str, table_name: str) -> None:
+    ensure_owned_database(connection_id, owner)
+    schema = get_current_schema(connection_id, owner)
+    if not any(table["schema_name"] == schema_name and table["table_name"] == table_name for table in schema["tables"]):
+        raise HTTPException(status_code=404, detail="Table not found")
+
+
+@router.get("/schema/tables/{schema_name}/{table_name}/metrics")
+def schema_table_metrics(
+    connection_id: str,
+    schema_name: str,
+    table_name: str,
+    user: dict[str, object] = Depends(current_user),
+) -> dict[str, Any]:
+    owner = _owner_subject(user)
+    _owned_schema_table(connection_id, owner, schema_name, table_name)
+    connection = connection_provider(connection_id, owner)()
+    try:
+        with connection.cursor(cursor_factory=RealDictCursor) as cursor:
+            cursor.execute(
+                """
+                WITH relation AS (SELECT to_regclass(format('%%I.%%I', %s, %s)) AS oid)
+                SELECT pg_total_relation_size(oid) AS total_size_bytes,
+                       pg_relation_size(oid) AS table_size_bytes,
+                       pg_indexes_size(oid) AS index_size_bytes
+                FROM relation
+                """,
+                (schema_name, table_name),
+            )
+            sizes = dict(cursor.fetchone() or {})
+            cursor.execute(
+                """SELECT n_live_tup, n_dead_tup, seq_scan, idx_scan
+                   FROM pg_stat_user_tables WHERE schemaname = %s AND relname = %s""",
+                (schema_name, table_name),
+            )
+            stats = dict(cursor.fetchone() or {})
+    finally:
+        connection.close()
+    live, dead = int(stats.get("n_live_tup") or 0), int(stats.get("n_dead_tup") or 0)
+    return {**sizes, **stats, "bloat_risk_ratio": dead / (live + dead) if live + dead else None}
+
+
+@router.get("/schema/tables/{schema_name}/{table_name}/preview")
+def schema_table_preview(
+    connection_id: str,
+    schema_name: str,
+    table_name: str,
+    limit: int = Query(default=50, ge=1, le=100),
+    user: dict[str, object] = Depends(current_user),
+) -> dict[str, Any]:
+    owner = _owner_subject(user)
+    _owned_schema_table(connection_id, owner, schema_name, table_name)
+    connection = connection_provider(connection_id, owner)()
+    try:
+        with connection.cursor(cursor_factory=RealDictCursor) as cursor:
+            cursor.execute(sql.SQL("SELECT * FROM {}.{} LIMIT {}").format(
+                sql.Identifier(schema_name), sql.Identifier(table_name), sql.Literal(limit)
+            ))
+            rows = [dict(row) for row in cursor.fetchall()]
+            columns = [column.name for column in cursor.description or []]
+    finally:
+        connection.close()
+    return {"columns": columns, "rows": rows, "row_count": len(rows)}

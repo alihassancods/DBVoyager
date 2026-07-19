@@ -23,18 +23,25 @@ class QueryExecutorInspector:
         connection = None
         try:
             connection = self._connection_provider()
+            connection.set_session(readonly=True, autocommit=False)
+            sql = query.strip().rstrip(";")
+            bounded_sql = f"SELECT * FROM ({sql}) AS dbvoyager_sample LIMIT 10"
 
             with connection.cursor(cursor_factory=RealDictCursor) as cursor:
-                cursor.execute(query)
+                cursor.execute("SET LOCAL statement_timeout = '10s'")
+                cursor.execute(bounded_sql)
                 rows = cursor.fetchmany(10)
                 result_rows = [dict(row) for row in rows]
 
             # Fixed: mapping 'query' to the required Pydantic field 'sql'
             return SQLResult(
-                sql=query,
+                sql=sql,
                 rows=result_rows,
             )
 
         except psycopg2.Error as exc:
             self._logger.exception("Query execution failed")
             raise RuntimeError(f"Failed to execute query: {exc}") from exc
+        finally:
+            if connection is not None:
+                connection.close()

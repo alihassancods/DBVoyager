@@ -4,6 +4,12 @@ import AuthPage from './pages/AuthPage';
 import { clearSession, isAuthenticated, refreshToken } from './lib/auth';
 import LandingPage from './pages/LandingPage';
 import ProductPage from './pages/ProductPage';
+import ConnectionsPage from './pages/ConnectionsPage';
+import QueryDetailsPage from './pages/QueryDetailsPage';
+import OptimizerPage from './pages/OptimizerPage';
+import SchemaExplorerPage from './pages/SchemaExplorerPage';
+import HealthChecksPage from './pages/HealthChecksPage';
+import BiChatPage from './pages/BiChatPage';
 
 function ProtectedRoute({ children }: { children: React.ReactNode }) {
   const [checking, setChecking] = useState(true);
@@ -33,6 +39,12 @@ export default function App() {
     <Route path="/login" element={<AuthPage signup={false} />} />
     <Route path="/signup" element={<AuthPage signup />} />
     <Route path="/dashboard" element={<ProtectedRoute><DashboardPage /></ProtectedRoute>} />
+    <Route path="/connections" element={<ProtectedRoute><ConnectionsPage /></ProtectedRoute>} />
+    <Route path="/optimizer" element={<ProtectedRoute><OptimizerPage /></ProtectedRoute>} />
+    <Route path="/schema-explorer" element={<ProtectedRoute><SchemaExplorerPage /></ProtectedRoute>} />
+    <Route path="/health-checks" element={<ProtectedRoute><HealthChecksPage /></ProtectedRoute>} />
+    <Route path="/bi-chat" element={<ProtectedRoute><BiChatPage /></ProtectedRoute>} />
+    <Route path="/connections/:connectionId/optimizer/queries/:queryId" element={<ProtectedRoute><QueryDetailsPage /></ProtectedRoute>} />
     <Route path="/:slug" element={<ProductPage />} />
     <Route path="*" element={<Navigate to="/" replace />} />
   </Routes></BrowserRouter>;

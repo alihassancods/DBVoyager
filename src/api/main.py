@@ -16,6 +16,7 @@ from .optimizer import router as optimizer_router
 from .business_api import router as business_router # Import the new router
 from .management import router as management_router
 from .analysis_repository import claim_due_collection_runs, run_scheduled_collection
+from .persistence_worker import process_persistence_jobs
 
 
 @asynccontextmanager
@@ -30,12 +31,22 @@ async def lifespan(_app: FastAPI):
                 pass
             await asyncio.sleep(30)
 
+    async def persistence_worker() -> None:
+        while True:
+            try:
+                await asyncio.to_thread(process_persistence_jobs)
+            except Exception:
+                pass
+            await asyncio.sleep(0.1)
+
     task = asyncio.create_task(scheduled_worker())
+    persistence_task = asyncio.create_task(persistence_worker())
     try:
         yield
     finally:
         task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
+        persistence_task.cancel()
+        await asyncio.gather(task, persistence_task, return_exceptions=True)
 
 app = FastAPI(
     title="DBVoyager API",

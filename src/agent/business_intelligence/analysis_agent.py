@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import time
+from collections.abc import Callable
 
 from src.agent.config import create_deepseek_llm
 
@@ -36,10 +37,16 @@ class AnalysisAgent:
         plan: InvestigationPlan,
         results: list[SQLResult],
     ) -> Insight:
-        """
-        Generate business insights
-        from SQL execution results.
-        """
+        return self.analyze_stream(question, plan, results)
+
+    def analyze_stream(
+        self,
+        question: str,
+        plan: InvestigationPlan,
+        results: list[SQLResult],
+        on_delta: Callable[[str], None] | None = None,
+    ) -> Insight:
+        """Generate an insight and optionally forward LLM text chunks."""
 
         self._logger.info(
             "Synthesizing business insight..."
@@ -90,34 +97,21 @@ RECOMMENDATIONS:
 
         start = time.perf_counter()
 
-        response = self._llm.invoke(prompt)
-
-        print(
-            f"Analysis LLM took "
-            f"{time.perf_counter() - start:.2f}s"
-        )
-
-        # Normalize response content to a single string
-        content = response.content
-        if isinstance(content, str):
-            text = content.strip()
-        elif isinstance(content, list):
-            parts: list[str] = []
-            for item in content:
-                if isinstance(item, str):
-                    parts.append(item)
-                else:
-                    try:
-                        parts.append(json.dumps(item))
-                    except Exception:
-                        parts.append(str(item))
-            text = "\n".join(parts).strip()
-        else:
-            # Fallback
-            try:
-                text = json.dumps(content).strip()
-            except Exception:
-                text = str(content).strip()
+        parts: list[str] = []
+        for chunk in self._llm.stream(prompt):
+            content = chunk.content
+            if isinstance(content, str):
+                text = content
+            elif isinstance(content, list):
+                text = "".join(item if isinstance(item, str) else json.dumps(item, default=str) for item in content)
+            else:
+                text = str(content)
+            if text:
+                parts.append(text)
+                if on_delta:
+                    on_delta(text)
+        text = "".join(parts).strip()
+        self._logger.info("Analysis LLM took %.2fs", time.perf_counter() - start)
 
         summary = text
 

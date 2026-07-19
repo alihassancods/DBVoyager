@@ -1,5 +1,6 @@
 from unittest.mock import MagicMock, patch
 
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from src.api.auth import current_user
@@ -120,6 +121,20 @@ def test_dashboard_refresh_persists_and_reads_the_latest_report() -> None:
     assert diagram.json() == report["schema_visualization"]
 
 
+def test_overview_is_collecting_before_the_first_report_exists() -> None:
+    app.dependency_overrides[current_user] = lambda: {"sub": "owner"}
+    try:
+        with patch("src.api.dashboard.get_dashboard_summary", return_value=None), patch(
+            "src.api.dashboard.get_latest_collection_report", side_effect=HTTPException(status_code=404)
+        ), patch("src.api.dashboard.get_latest_report", side_effect=HTTPException(status_code=404)):
+            response = client.get("/connections/connection-1/overview")
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 202
+    assert response.json() == {"collection_status": "collecting"}
+
+
 def test_dashboard_refresh_stream_emits_progress_and_compact_completion() -> None:
     _connections.clear()
     _credentials.clear()
@@ -144,7 +159,9 @@ def test_dashboard_refresh_stream_emits_progress_and_compact_completion() -> Non
 
         with patch("src.api.dashboard.ensure_owned_database"), patch(
             "src.api.dashboard.create_analysis_run", return_value="run-1"
-        ), patch("src.api.dashboard.run_analysis", side_effect=collect):
+        ), patch("src.api.dashboard.collect_analysis", side_effect=collect), patch(
+            "src.api.dashboard.publish_preview", return_value=True
+        ):
             with client.stream("POST", "/connections/connection-1/dashboard/refresh/stream") as response:
                 events = "".join(response.iter_text())
     finally:
@@ -152,7 +169,7 @@ def test_dashboard_refresh_stream_emits_progress_and_compact_completion() -> Non
 
     assert response.headers["content-type"].startswith("text/event-stream")
     assert 'event: progress\ndata: {"stage": "statistics", "status": "started"}' in events
-    assert 'event: complete\ndata: {"analysis_run_id": "run-1", "status": "succeeded"}' in events
+    assert 'event: data_ready\ndata: {"analysis_run_id": "run-1"' in events
 
 
 def test_analysis_run_stream_emits_terminal_report() -> None:

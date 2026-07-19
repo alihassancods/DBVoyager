@@ -13,7 +13,12 @@ from src.db_engine.inspectors.schema_inspector import SchemaInspector
 from src.db_engine.inspectors.statistics.query_stats_inspector import QueryStatsInspector
 from src.models.api.optimizer_request import CompareQueryRequest, OptimizeQueryRequest
 
-from .analysis_repository import ensure_owned_database, get_latest_slow_queries, get_slow_query
+from .analysis_repository import (
+    ensure_owned_database,
+    get_latest_slow_queries,
+    get_slow_query,
+    get_slow_query_detail,
+)
 from .auth import current_user
 from .store import connection_provider, get_connection
 
@@ -57,6 +62,42 @@ def slow_queries(
     return {"data": get_latest_slow_queries(connection_id, owner, limit)}
 
 
+@router.get("/queries/{query_id}")
+def query_detail(
+    connection_id: str,
+    query_id: str,
+    user: dict[str, object] = Depends(current_user),
+) -> dict[str, Any]:
+    owner = _owner_subject(user)
+    ensure_owned_database(connection_id, owner)
+    return get_slow_query_detail(connection_id, owner, query_id)
+
+
+@router.post("/queries/{query_id}/plan")
+def query_plan(
+    connection_id: str,
+    query_id: str,
+    user: dict[str, object] = Depends(current_user),
+) -> dict[str, Any]:
+    """Generate a plain, read-only PostgreSQL EXPLAIN for a stored query."""
+    owner = _owner_subject(user)
+    ensure_owned_database(connection_id, owner)
+    get_connection(connection_id, owner)
+    detail = get_slow_query_detail(connection_id, owner, query_id)
+    validation = SQLValidator().validate(str(detail["query"]))
+    if not validation.is_valid:
+        raise HTTPException(status_code=400, detail=f"Stored query is unsafe: {validation.reason}")
+    try:
+        plan = ExplainPlanInspector(connection_provider(connection_id, owner)).get_plan(str(detail["query"]))
+    except RuntimeError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {
+        "query_id": query_id,
+        "costs": plan.costs.model_dump(),
+        "raw_plan": plan.raw_plan,
+    }
+
+
 @router.post("/optimizations")
 def optimize_query(
     connection_id: str,
@@ -70,6 +111,9 @@ def optimize_query(
     if not validation.is_valid:
         raise HTTPException(status_code=400, detail=f"Stored query is unsafe: {validation.reason}")
     result = agent.optimize_query(query)
+    optimized_validation = SQLValidator().validate(result.optimized_query)
+    if not optimized_validation.is_valid:
+        raise HTTPException(status_code=422, detail=f"Optimizer returned unsafe SQL: {optimized_validation.reason}")
     from .analysis_repository import _app_connection
     with _app_connection() as connection:
         with connection.cursor() as cursor:
@@ -100,9 +144,12 @@ def compare_queries(
         validation = SQLValidator().validate(query)
         if not validation.is_valid:
             raise HTTPException(status_code=400, detail=validation.reason)
-    comparison = _owned_agent(connection_id, user).compare_queries(
-        request.original_query, request.optimized_query
-    )
+    try:
+        comparison = _owned_agent(connection_id, user).compare_queries(
+            request.original_query, request.optimized_query
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     return comparison.model_dump()
 
 

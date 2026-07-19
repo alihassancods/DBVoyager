@@ -440,3 +440,172 @@ END;
 $$;
 
 COMMIT;
+
+-- Fresh installs use this file alone. The older numbered files remain only
+-- for databases created before this bootstrap was consolidated.
+BEGIN;
+
+ALTER TABLE monitored_databases ADD COLUMN archived_at timestamptz;
+CREATE INDEX monitored_databases_owner_active_idx ON monitored_databases (owner_user_id, updated_at DESC) WHERE archived_at IS NULL AND deleted_at IS NULL;
+
+ALTER TABLE analysis_runs ADD COLUMN collection_kind text NOT NULL DEFAULT 'dashboard'
+    CHECK (collection_kind IN ('dashboard', 'brief', 'statistics', 'slow_queries', 'schema', 'health_checks', 'table_summaries'));
+CREATE INDEX analysis_runs_collection_kind_history_idx ON analysis_runs (monitored_database_id, collection_kind, finished_at DESC) WHERE status = 'succeeded';
+
+ALTER TABLE health_findings
+    ADD COLUMN user_state text NOT NULL DEFAULT 'open' CHECK (user_state IN ('open', 'acknowledged', 'muted')),
+    ADD COLUMN user_note text,
+    ADD COLUMN state_updated_at timestamptz;
+
+CREATE TABLE dashboard_summaries (
+    monitored_database_id uuid PRIMARY KEY REFERENCES monitored_databases(id) ON DELETE CASCADE,
+    analysis_run_id uuid REFERENCES analysis_runs(id) ON DELETE SET NULL,
+    overview_json jsonb NOT NULL,
+    etag char(64) NOT NULL,
+    updated_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE dashboard_resources (
+    monitored_database_id uuid NOT NULL REFERENCES monitored_databases(id) ON DELETE CASCADE,
+    resource text NOT NULL,
+    analysis_run_id uuid REFERENCES analysis_runs(id) ON DELETE SET NULL,
+    version bigint NOT NULL DEFAULT 1 CHECK (version > 0),
+    etag char(64) NOT NULL,
+    payload_json jsonb NOT NULL,
+    generated_at timestamptz NOT NULL,
+    updated_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (monitored_database_id, resource)
+);
+CREATE INDEX dashboard_resources_updated_idx ON dashboard_resources (updated_at DESC);
+
+CREATE TABLE collection_metrics (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    analysis_run_id uuid NOT NULL REFERENCES analysis_runs(id) ON DELETE CASCADE,
+    stage text NOT NULL,
+    duration_ms integer CHECK (duration_ms >= 0),
+    item_count integer CHECK (item_count >= 0),
+    payload_bytes integer CHECK (payload_bytes >= 0),
+    created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX collection_metrics_run_stage_idx ON collection_metrics (analysis_run_id, stage, created_at);
+
+CREATE TABLE analysis_run_events (
+    id bigserial PRIMARY KEY,
+    analysis_run_id uuid NOT NULL REFERENCES analysis_runs(id) ON DELETE CASCADE,
+    stage text NOT NULL,
+    message text NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX analysis_run_events_run_id_idx ON analysis_run_events (analysis_run_id, id);
+
+CREATE TABLE collection_schedules (
+    monitored_database_id uuid NOT NULL REFERENCES monitored_databases(id) ON DELETE CASCADE,
+    collection_kind text NOT NULL CHECK (collection_kind IN ('brief', 'dashboard')),
+    interval_seconds integer NOT NULL CHECK (interval_seconds >= 60),
+    next_scheduled_at timestamptz NOT NULL DEFAULT now(),
+    enabled boolean NOT NULL DEFAULT true,
+    PRIMARY KEY (monitored_database_id, collection_kind)
+);
+CREATE INDEX collection_schedules_due_idx ON collection_schedules (next_scheduled_at) WHERE enabled;
+
+CREATE TABLE database_stat_daily_rollups (
+    monitored_database_id uuid NOT NULL REFERENCES monitored_databases(id) ON DELETE CASCADE,
+    collected_on date NOT NULL,
+    avg_num_connections numeric(14, 2) NOT NULL,
+    max_database_size_mb numeric(14, 2) NOT NULL,
+    avg_cache_hit_ratio numeric(5, 2),
+    PRIMARY KEY (monitored_database_id, collected_on)
+);
+
+CREATE TABLE query_optimizations (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    monitored_database_id uuid NOT NULL REFERENCES monitored_databases(id) ON DELETE CASCADE,
+    query_snapshot_id uuid NOT NULL REFERENCES query_stat_snapshots(id) ON DELETE CASCADE,
+    original_query text NOT NULL,
+    optimized_query text NOT NULL,
+    explanation text NOT NULL,
+    index_recommendations jsonb NOT NULL DEFAULT '[]'::jsonb,
+    feedback text CHECK (feedback IN ('useful', 'not_useful')),
+    feedback_note text,
+    created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX query_optimizations_database_created_idx ON query_optimizations (monitored_database_id, created_at DESC);
+
+CREATE TABLE database_settings (
+    monitored_database_id uuid PRIMARY KEY REFERENCES monitored_databases(id) ON DELETE CASCADE,
+    settings jsonb NOT NULL DEFAULT '{}'::jsonb,
+    updated_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE kpi_candidates (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    monitored_database_id uuid NOT NULL REFERENCES monitored_databases(id) ON DELETE CASCADE,
+    schema_revision_id uuid NOT NULL REFERENCES schema_revisions(id) ON DELETE CASCADE,
+    candidate_json jsonb NOT NULL,
+    status text NOT NULL DEFAULT 'proposed' CHECK (status IN ('proposed', 'approved', 'rejected')),
+    created_at timestamptz NOT NULL DEFAULT now(),
+    decided_at timestamptz
+);
+CREATE INDEX kpi_candidates_database_status_idx ON kpi_candidates (monitored_database_id, status, created_at DESC);
+
+CREATE TABLE kpi_definitions (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    candidate_id uuid NOT NULL UNIQUE REFERENCES kpi_candidates(id) ON DELETE RESTRICT,
+    monitored_database_id uuid NOT NULL REFERENCES monitored_databases(id) ON DELETE CASCADE,
+    schema_revision_id uuid NOT NULL REFERENCES schema_revisions(id) ON DELETE RESTRICT,
+    definition_json jsonb NOT NULL,
+    active boolean NOT NULL DEFAULT true,
+    created_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE kpi_snapshots (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    kpi_definition_id uuid NOT NULL REFERENCES kpi_definitions(id) ON DELETE CASCADE,
+    monitored_database_id uuid NOT NULL REFERENCES monitored_databases(id) ON DELETE CASCADE,
+    analysis_run_id uuid REFERENCES analysis_runs(id) ON DELETE SET NULL,
+    sql_text text NOT NULL,
+    points_json jsonb NOT NULL,
+    row_count integer NOT NULL CHECK (row_count >= 0),
+    execution_ms double precision NOT NULL CHECK (execution_ms >= 0),
+    status text NOT NULL CHECK (status IN ('succeeded', 'failed')),
+    error_message text,
+    created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX kpi_snapshots_database_definition_created_idx ON kpi_snapshots (monitored_database_id, kpi_definition_id, created_at DESC);
+
+CREATE TABLE kpi_generation_statuses (
+    monitored_database_id uuid PRIMARY KEY REFERENCES monitored_databases(id) ON DELETE CASCADE,
+    analysis_run_id uuid REFERENCES analysis_runs(id) ON DELETE SET NULL,
+    status text NOT NULL CHECK (status IN ('running', 'succeeded', 'failed', 'unavailable')),
+    generated_count integer NOT NULL DEFAULT 0 CHECK (generated_count >= 0),
+    error_message text,
+    updated_at timestamptz NOT NULL DEFAULT now()
+);
+
+ALTER TABLE dashboard_summaries ENABLE ROW LEVEL SECURITY;
+ALTER TABLE dashboard_resources ENABLE ROW LEVEL SECURITY;
+ALTER TABLE collection_metrics ENABLE ROW LEVEL SECURITY;
+ALTER TABLE collection_schedules ENABLE ROW LEVEL SECURITY;
+ALTER TABLE analysis_run_events ENABLE ROW LEVEL SECURITY;
+ALTER TABLE database_stat_daily_rollups ENABLE ROW LEVEL SECURITY;
+ALTER TABLE query_optimizations ENABLE ROW LEVEL SECURITY;
+ALTER TABLE database_settings ENABLE ROW LEVEL SECURITY;
+ALTER TABLE kpi_candidates ENABLE ROW LEVEL SECURITY;
+ALTER TABLE kpi_definitions ENABLE ROW LEVEL SECURITY;
+ALTER TABLE kpi_snapshots ENABLE ROW LEVEL SECURITY;
+ALTER TABLE kpi_generation_statuses ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY dashboard_summaries_owner ON dashboard_summaries FOR SELECT USING (EXISTS (SELECT 1 FROM monitored_databases d WHERE d.id = monitored_database_id AND d.owner_user_id = app_current_user_id()));
+CREATE POLICY dashboard_resources_owner ON dashboard_resources FOR SELECT USING (EXISTS (SELECT 1 FROM monitored_databases d WHERE d.id = monitored_database_id AND d.owner_user_id = app_current_user_id()));
+CREATE POLICY collection_metrics_owner ON collection_metrics FOR SELECT USING (EXISTS (SELECT 1 FROM analysis_runs r JOIN monitored_databases d ON d.id = r.monitored_database_id WHERE r.id = analysis_run_id AND d.owner_user_id = app_current_user_id()));
+CREATE POLICY collection_schedules_owner ON collection_schedules FOR SELECT USING (EXISTS (SELECT 1 FROM monitored_databases d WHERE d.id = monitored_database_id AND d.owner_user_id = app_current_user_id()));
+CREATE POLICY analysis_run_events_owner ON analysis_run_events FOR SELECT USING (EXISTS (SELECT 1 FROM analysis_runs r JOIN monitored_databases d ON d.id = r.monitored_database_id WHERE r.id = analysis_run_id AND d.owner_user_id = app_current_user_id()));
+CREATE POLICY database_stat_daily_rollups_owner ON database_stat_daily_rollups FOR SELECT USING (EXISTS (SELECT 1 FROM monitored_databases d WHERE d.id = monitored_database_id AND d.owner_user_id = app_current_user_id()));
+CREATE POLICY query_optimizations_owner ON query_optimizations FOR SELECT USING (EXISTS (SELECT 1 FROM monitored_databases d WHERE d.id = monitored_database_id AND d.owner_user_id = app_current_user_id()));
+CREATE POLICY database_settings_owner ON database_settings FOR SELECT USING (EXISTS (SELECT 1 FROM monitored_databases d WHERE d.id = monitored_database_id AND d.owner_user_id = app_current_user_id()));
+CREATE POLICY kpi_candidates_owner ON kpi_candidates FOR SELECT USING (EXISTS (SELECT 1 FROM monitored_databases d WHERE d.id = monitored_database_id AND d.owner_user_id = app_current_user_id()));
+CREATE POLICY kpi_definitions_owner ON kpi_definitions FOR SELECT USING (EXISTS (SELECT 1 FROM monitored_databases d WHERE d.id = monitored_database_id AND d.owner_user_id = app_current_user_id()));
+CREATE POLICY kpi_snapshots_owner ON kpi_snapshots FOR SELECT USING (EXISTS (SELECT 1 FROM monitored_databases d WHERE d.id = monitored_database_id AND d.owner_user_id = app_current_user_id()));
+CREATE POLICY kpi_generation_statuses_owner ON kpi_generation_statuses FOR SELECT USING (EXISTS (SELECT 1 FROM monitored_databases d WHERE d.id = monitored_database_id AND d.owner_user_id = app_current_user_id()));
+
+COMMIT;

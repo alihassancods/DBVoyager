@@ -123,15 +123,18 @@ def list_connections(auth_subject: str) -> list[dict[str, Any]]:
         with connection.cursor() as cursor:
             cursor.execute("""
                 SELECT databases.id, databases.display_name, databases.status, databases.last_collected_at,
-                       databases.database_size_mb, databases.num_connections, databases.deleted_at
-                FROM monitored_databases AS databases JOIN users ON users.id = databases.owner_user_id
+                       databases.database_size_mb, databases.num_connections, databases.archived_at,
+                       databases.cache_hit_ratio, credentials.encrypted_data_key, credentials.ciphertext,
+                       credentials.nonce, credentials.auth_tag
+                FROM monitored_databases AS databases
+                JOIN users ON users.id = databases.owner_user_id
+                LEFT JOIN database_credentials AS credentials
+                    ON credentials.monitored_database_id = databases.id AND credentials.is_active
                 WHERE users.auth_subject = %s AND databases.deleted_at IS NULL
                 ORDER BY databases.updated_at DESC
             """, (auth_subject,))
             rows = cursor.fetchall()
-    return [{"connection_id": str(row[0]), "display_name": row[1], "status": row[2],
-             "last_analyzed_at": row[3], "database_size_mb": row[4], "num_connections": row[5],
-             "archived_at": row[6]} for row in rows]
+    return [_connection_metadata_from_row(row) for row in rows]
 
 
 def connection_metadata(connection_id: str, auth_subject: str) -> dict[str, Any]:
@@ -139,16 +142,37 @@ def connection_metadata(connection_id: str, auth_subject: str) -> dict[str, Any]
         with connection.cursor() as cursor:
             cursor.execute("""
                 SELECT databases.id, databases.display_name, databases.status, databases.last_collected_at,
-                       databases.database_size_mb, databases.num_connections, databases.deleted_at
-                FROM monitored_databases AS databases JOIN users ON users.id = databases.owner_user_id
+                       databases.database_size_mb, databases.num_connections, databases.archived_at,
+                       databases.cache_hit_ratio, credentials.encrypted_data_key, credentials.ciphertext,
+                       credentials.nonce, credentials.auth_tag
+                FROM monitored_databases AS databases
+                JOIN users ON users.id = databases.owner_user_id
+                LEFT JOIN database_credentials AS credentials
+                    ON credentials.monitored_database_id = databases.id AND credentials.is_active
                 WHERE databases.id = %s AND users.auth_subject = %s
             """, (connection_id, auth_subject))
             row = cursor.fetchone()
     if row is None:
         raise HTTPException(status_code=404, detail="Database not found")
-    return {"connection_id": str(row[0]), "display_name": row[1], "status": row[2],
-            "last_analyzed_at": row[3], "database_size_mb": row[4], "num_connections": row[5],
-            "archived_at": row[6]}
+    return _connection_metadata_from_row(row)
+
+
+def _connection_metadata_from_row(row: tuple[Any, ...]) -> dict[str, Any]:
+    connection_id = str(row[0])
+    credentials = _decode_credentials(connection_id, row[8:12]) if all(row[8:12]) else {}
+    return {
+        "connection_id": connection_id,
+        "display_name": row[1],
+        "status": row[2],
+        "last_analyzed_at": row[3],
+        "database_size_mb": row[4],
+        "num_connections": row[5],
+        "archived_at": row[6],
+        "cache_hit_ratio": row[7],
+        "host": credentials.get("host"),
+        "port": credentials.get("port"),
+        "database": credentials.get("database"),
+    }
 
 
 def rename_connection(connection_id: str, auth_subject: str, display_name: str) -> dict[str, Any]:

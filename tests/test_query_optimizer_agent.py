@@ -1,4 +1,5 @@
-from unittest.mock import Mock
+import json
+from unittest.mock import Mock, patch
 
 from src.agent.query_optimizer.optimizer_agent import (
     QueryOptimizerAgent,
@@ -106,3 +107,26 @@ def test_compare_queries():
     assert result.total_cost_after == 50
 
     assert result.improvement_percent == 50.0
+
+
+def test_optimize_continues_when_historical_query_cannot_be_explained():
+    query_stats_inspector = Mock()
+    schema_inspector = Mock()
+    schema_inspector.inspect.return_value = DatabaseSchema(
+        tables=[], columns=[], primary_keys=[], foreign_keys=[], relations=[], indexes=[]
+    )
+    explain_plan_inspector = Mock()
+    explain_plan_inspector.get_plan.side_effect = RuntimeError("Execution plan generation failed: 42803")
+    llm = Mock()
+    llm.invoke.return_value.content = json.dumps({
+        "optimized_query": "SELECT 1",
+        "explanation": "Use a valid grouped expression.",
+        "index_recommendations": [],
+    })
+
+    with patch("src.agent.query_optimizer.optimizer_agent.create_deepseek_llm", return_value=llm):
+        agent = QueryOptimizerAgent(query_stats_inspector, schema_inspector, explain_plan_inspector)
+        result = agent.optimize_query("SELECT DATE_TRUNC($1, created_at) FROM orders")
+
+    assert result.optimized_query == "SELECT 1"
+    assert "unavailable" in llm.invoke.call_args.args[0][0].content

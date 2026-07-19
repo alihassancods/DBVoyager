@@ -1,6 +1,7 @@
 """Inspector responsible for retrieving PostgreSQL execution plans."""
 
 import logging
+import re
 from collections.abc import Callable
 from typing import Any
 
@@ -13,6 +14,7 @@ from src.models.explain.explain_plan_model import (
 )
 
 ConnectionProvider = Callable[[], Any]
+_PARAMETER = re.compile(r"\$(\d+)\b")
 
 
 class ExplainPlanInspector:
@@ -55,9 +57,8 @@ class ExplainPlanInspector:
                 cursor_factory=RealDictCursor
             ) as cursor:
 
-                cursor.execute(
-                    f"EXPLAIN (FORMAT JSON) {query}"
-                )
+                explain_query = _PARAMETER.sub("NULL", query)
+                cursor.execute(f"EXPLAIN (FORMAT JSON) {explain_query}")
 
                 row = cursor.fetchone()
 
@@ -80,7 +81,7 @@ class ExplainPlanInspector:
 
         except psycopg2.Error as exc:
             # We catch database-side errors (e.g., Table does not exist, syntax errors)
-            self._logger.exception(
+            self._logger.warning(
                 f"Database error during EXPLAIN generation: {exc.pgerror or exc}"
             )
             raise RuntimeError(

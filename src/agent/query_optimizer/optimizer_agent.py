@@ -96,17 +96,17 @@ class QueryOptimizerAgent:
 
         schema = self._schema_inspector.inspect()
 
-        explain_plan = (
-            self._explain_plan_inspector.get_plan(
-                query
-            )
-        )
+        try:
+            plan = self._explain_plan_inspector.get_plan(query).raw_plan
+        except RuntimeError as exc:
+            self._logger.warning("EXPLAIN unavailable for stored query: %s", exc)
+            plan = {"unavailable": str(exc)}
 
         prompt = OPTIMIZATION_PROMPT.format(
             schema=self._schema_to_text(schema),
             query=query,
             plan=json.dumps(
-                explain_plan.raw_plan,
+                plan,
                 indent=2,
                 default=str,
             ),

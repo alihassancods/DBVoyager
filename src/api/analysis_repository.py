@@ -18,6 +18,7 @@ from psycopg2.extras import Json, execute_values
 from src.agent import TableBusinessSummaryAgent, TableSummaryInput
 from src.agent.kpi import generate_kpis
 from .brief import collect_brief
+from .resource_cache import publish_preview, warm_json
 from v1 import build_report
 
 
@@ -25,6 +26,10 @@ ConnectionProvider = Callable[[], Any]
 ProgressCallback = Callable[[str, str], None]
 _progress_events: dict[str, list[dict[str, str]]] = {}
 _progress_lock = Lock()
+
+
+def _json(value: Any) -> Json:
+    return Json(value, dumps=lambda data: json.dumps(data, default=str))
 
 
 def get_analysis_progress(run_id: str, offset: int) -> tuple[list[dict[str, str]], int]:
@@ -210,7 +215,7 @@ def prune_database_history(connection_id: str) -> None:
             )
 
 
-def run_analysis(
+def collect_analysis(
     run_id: str,
     connection_id: str,
     database_name: str,
@@ -218,6 +223,7 @@ def run_analysis(
     progress: ProgressCallback | None = None,
     collection_kind: str = "dashboard",
 ) -> dict[str, Any]:
+    """Collect a target-database report without app-database snapshot writes."""
     _set_running(run_id)
     started = time.monotonic()
     try:
@@ -235,14 +241,65 @@ def run_analysis(
         else:
             report = build_report(database_name, connection_provider, progress, sections)
         _record_collection_metric(run_id, "collection", int((time.monotonic() - started) * 1000), len(json.dumps(report, default=str)))
-        if progress:
-            progress("persistence", "Saving analysis results.")
-        if collection_kind == "brief":
-            _persist_brief(run_id, connection_id, report)
-        else:
-            _persist_report(run_id, connection_id, report, progress, collection_kind)
-        if progress:
-            progress("persistence", "Analysis results saved.")
+        return report
+    except Exception as exc:
+        _mark_failed(run_id, f"{type(exc).__name__}: {exc}")
+        raise
+
+
+def persist_collected_analysis(
+    run_id: str, connection_id: str, report: dict[str, Any], collection_kind: str,
+    progress: ProgressCallback | None = None,
+) -> None:
+    """Persist an already-collected report; called synchronously or by the Redis worker."""
+    if progress:
+        progress("persistence", "Saving analysis results.")
+    if collection_kind == "brief":
+        _persist_brief(run_id, connection_id, report)
+    else:
+        _persist_report(run_id, connection_id, report, progress, collection_kind)
+    if progress:
+        progress("persistence", "Analysis results saved.")
+
+
+def run_post_persist_enrichment(
+    connection_id: str,
+    run_id: str,
+    report: dict[str, Any],
+    connection_provider: ConnectionProvider,
+) -> None:
+    """Run optional enrichment only after the durable snapshot has committed."""
+    schema = _ok_data(report, "schema")
+    try:
+        generated = generate_kpis(
+            connection_id, connection_provider,
+            lambda stage, message: _record_progress(run_id, stage, message), run_id,
+        )
+        _record_progress(run_id, "kpis", f"KPI generation completed: {generated} metrics.")
+    except Exception as exc:
+        _record_progress(run_id, "kpis", f"KPI generation failed: {type(exc).__name__}.")
+    if schema is not None:
+        try:
+            _generate_table_summaries(
+                connection_id, run_id, schema,
+                lambda stage, message: _record_progress(run_id, stage, message),
+            )
+        except Exception as exc:
+            _record_progress(run_id, "summaries", f"Deferred summaries skipped: {type(exc).__name__}.")
+    try:
+        prune_database_history(connection_id)
+    except Exception as exc:
+        _record_progress(run_id, "retention", f"Retention deferred: {type(exc).__name__}.")
+
+
+def run_analysis(
+    run_id: str, connection_id: str, database_name: str, connection_provider: ConnectionProvider,
+    progress: ProgressCallback | None = None, collection_kind: str = "dashboard",
+) -> dict[str, Any]:
+    """Compatibility path for callers that require collection and persistence together."""
+    report = collect_analysis(run_id, connection_id, database_name, connection_provider, progress, collection_kind)
+    try:
+        persist_collected_analysis(run_id, connection_id, report, collection_kind, progress)
         return report
     except Exception as exc:
         _mark_failed(run_id, f"{type(exc).__name__}: {exc}")
@@ -271,7 +328,7 @@ def run_analysis_in_background(
 ) -> None:
     try:
         _record_progress(run_id, "analysis", "Starting database analysis.")
-        report = run_analysis(
+        report = collect_analysis(
             run_id,
             connection_id,
             database_name,
@@ -279,27 +336,12 @@ def run_analysis_in_background(
             lambda stage, message: _record_progress(run_id, stage, message),
             collection_kind,
         )
+        if publish_preview(connection_id, run_id, collection_kind, report):
+            _record_progress(run_id, "data_ready", "Collected data is ready for the dashboard.")
+            return
+        persist_collected_analysis(run_id, connection_id, report, collection_kind, lambda stage, message: _record_progress(run_id, stage, message))
         if collection_kind == "dashboard":
-            schema = _ok_data(report, "schema")
-            try:
-                generated = generate_kpis(
-                    connection_id,
-                    connection_provider,
-                    lambda stage, message: _record_progress(run_id, stage, message),
-                    run_id,
-                )
-                _record_progress(run_id, "kpis", f"KPI generation completed: {generated} metrics.")
-            except Exception as exc:
-                _record_progress(run_id, "kpis", f"KPI generation failed: {type(exc).__name__}.")
-            if schema is not None:
-                try:
-                    _generate_table_summaries(connection_id, run_id, schema, lambda stage, message: _record_progress(run_id, stage, message))
-                except Exception as exc:
-                    _record_progress(run_id, "summaries", f"Deferred summaries skipped: {type(exc).__name__}.")
-            try:
-                prune_database_history(connection_id)
-            except Exception as exc:
-                _record_progress(run_id, "retention", f"Retention deferred: {type(exc).__name__}.")
+            run_post_persist_enrichment(connection_id, run_id, report, connection_provider)
         _record_progress(run_id, "analysis", "Analysis report persisted.")
     except Exception as exc:
         _record_progress(run_id, "error", f"{type(exc).__name__}: {exc}")
@@ -374,19 +416,19 @@ def get_latest_statistics(connection_id: str, auth_subject: str) -> dict[str, An
             )
             queries = cursor.fetchall()
             cursor.execute(
-                """SELECT table.table_name, snapshot.seq_scan, snapshot.idx_scan,
+                """SELECT database_table.table_name, snapshot.seq_scan, snapshot.idx_scan,
                           snapshot.n_live_tup, snapshot.n_dead_tup
                    FROM table_stat_snapshots snapshot
-                   JOIN database_tables table ON table.id = snapshot.database_table_id
+                   JOIN database_tables database_table ON database_table.id = snapshot.database_table_id
                    WHERE snapshot.run_id = %s ORDER BY snapshot.seq_scan DESC LIMIT 200""",
                 (run_id,),
             )
             tables = cursor.fetchall()
             cursor.execute(
-                """SELECT COALESCE(table.table_name, ''), snapshot.index_name, snapshot.idx_scan,
+                """SELECT COALESCE(database_table.table_name, ''), snapshot.index_name, snapshot.idx_scan,
                           snapshot.idx_tup_read, snapshot.idx_tup_fetch
                    FROM index_stat_snapshots snapshot
-                   LEFT JOIN database_tables table ON table.id = snapshot.database_table_id
+                   LEFT JOIN database_tables database_table ON database_table.id = snapshot.database_table_id
                    WHERE snapshot.run_id = %s ORDER BY snapshot.idx_scan DESC LIMIT 200""",
                 (run_id,),
             )
@@ -570,6 +612,40 @@ def get_slow_query(connection_id: str, auth_subject: str, query_id: str) -> str:
     return str(row[0])
 
 
+def get_slow_query_detail(connection_id: str, auth_subject: str, query_id: str) -> dict[str, Any]:
+    """Return one persisted slow-query snapshot, scoped to its owner."""
+    with _app_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT snapshots.id, snapshots.query_text, snapshots.calls,
+                       snapshots.total_exec_time_ms, snapshots.mean_exec_time_ms,
+                       snapshots.rows_returned, runs.finished_at, databases.cache_hit_ratio
+                FROM query_stat_snapshots AS snapshots
+                JOIN analysis_runs AS runs ON runs.id = snapshots.run_id
+                JOIN monitored_databases AS databases ON databases.id = runs.monitored_database_id
+                JOIN users ON users.id = databases.owner_user_id
+                WHERE snapshots.id = %s
+                  AND runs.monitored_database_id = %s
+                  AND users.auth_subject = %s
+                """,
+                (query_id, connection_id, auth_subject),
+            )
+            row = cursor.fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Slow query not found")
+    return {
+        "query_id": str(row[0]),
+        "query": row[1],
+        "calls": row[2],
+        "total_exec_time": row[3],
+        "mean_exec_time": row[4],
+        "rows_returned": row[5],
+        "collected_at": row[6],
+        "cache_hit_ratio": row[7],
+    }
+
+
 def _set_running(run_id: str) -> None:
     with _app_connection() as connection:
         with connection.cursor() as cursor:
@@ -620,14 +696,25 @@ def _persist_brief(run_id: str, connection_id: str, report: dict[str, Any]) -> N
                               cache_hit_ratio = %s, last_collected_at = now(), last_successful_run_id = %s WHERE id = %s""",
                            (database.get("num_connections"), database.get("database_size_mb"), database.get("cache_hit_ratio"), run_id, connection_id))
             cursor.execute("""UPDATE analysis_runs SET status = 'succeeded', finished_at = now(), lease_expires_at = NULL,
-                              report_json = %s WHERE id = %s""", (Json(report), run_id))
+                              report_json = %s WHERE id = %s""", (_json(report), run_id))
             cursor.execute(
                 """INSERT INTO dashboard_summaries (monitored_database_id, analysis_run_id, overview_json, etag)
                    VALUES (%s, %s, %s, %s)
                    ON CONFLICT (monitored_database_id) DO UPDATE SET analysis_run_id = EXCLUDED.analysis_run_id,
                        overview_json = EXCLUDED.overview_json, etag = EXCLUDED.etag, updated_at = now()""",
-                (connection_id, run_id, Json(overview), etag),
+                (connection_id, run_id, _json(overview), etag),
             )
+            cursor.execute(
+                """INSERT INTO dashboard_resources (
+                       monitored_database_id, resource, analysis_run_id, etag, payload_json, generated_at
+                   ) VALUES (%s, 'overview', %s, %s, %s, now())
+                   ON CONFLICT (monitored_database_id, resource) DO UPDATE SET
+                       analysis_run_id = EXCLUDED.analysis_run_id, etag = EXCLUDED.etag,
+                       payload_json = EXCLUDED.payload_json, generated_at = EXCLUDED.generated_at,
+                       version = dashboard_resources.version + 1, updated_at = now()""",
+                (connection_id, run_id, etag, _json(overview)),
+            )
+    warm_json(connection_id, "overview", overview)
 
 
 def get_dashboard_summary(connection_id: str, auth_subject: str) -> tuple[dict[str, Any], str] | None:
@@ -635,16 +722,32 @@ def get_dashboard_summary(connection_id: str, auth_subject: str) -> tuple[dict[s
         with _app_connection() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
-                    """SELECT summaries.overview_json, summaries.etag FROM dashboard_summaries AS summaries
-                       JOIN monitored_databases AS databases ON databases.id = summaries.monitored_database_id
+                    """SELECT resources.payload_json, resources.etag FROM dashboard_resources AS resources
+                       JOIN monitored_databases AS databases ON databases.id = resources.monitored_database_id
                        JOIN users ON users.id = databases.owner_user_id
-                       WHERE summaries.monitored_database_id = %s AND users.auth_subject = %s
+                       WHERE resources.monitored_database_id = %s AND resources.resource = 'overview'
+                         AND users.auth_subject = %s
                          AND databases.deleted_at IS NULL""",
                     (connection_id, auth_subject),
                 )
                 row = cursor.fetchone()
     except psycopg2.errors.UndefinedTable:
-        return None
+        row = None
+    if row is None:
+        try:
+            with _app_connection() as connection:
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        """SELECT summaries.overview_json, summaries.etag FROM dashboard_summaries AS summaries
+                           JOIN monitored_databases AS databases ON databases.id = summaries.monitored_database_id
+                           JOIN users ON users.id = databases.owner_user_id
+                           WHERE summaries.monitored_database_id = %s AND users.auth_subject = %s
+                             AND databases.deleted_at IS NULL""",
+                        (connection_id, auth_subject),
+                    )
+                    row = cursor.fetchone()
+        except psycopg2.errors.UndefinedTable:
+            return None
     return (row[0], str(row[1])) if row else None
 
 
@@ -697,7 +800,7 @@ def _persist_report(
                 """,
                 (
                     "succeeded" if complete else "failed",
-                    Json(report),
+                    _json(report),
                     schema_revision_id,
                     _fingerprint(schema) if schema is not None else None,
                     None if complete else "collection_incomplete",
@@ -753,65 +856,49 @@ def _persist_statistics(
         (table["schema_name"], table["table_name"]): table
         for table in (schema or {}).get("tables", [])
     }
-    table_ids: dict[str, str] = {}
-    table_stats = statistics.get("table_stats", [])
-    for number, table_stat in enumerate(table_stats, start=1):
+    table_rows: list[tuple[Any, ...]] = []
+    for table_stat in statistics.get("table_stats", []):
         table = table_metadata.get(("public", table_stat["table_name"]))
         if table is None:
             continue
-        cursor.execute(
-            """
+        table_rows.append((
+            connection_id, table["schema_name"], table["table_name"], table["table_type"],
+            table["estimated_rows"], table_stat["seq_scan"], table_stat["idx_scan"],
+            table_stat["n_live_tup"], table_stat["n_dead_tup"], collected_at,
+        ))
+
+    table_ids: dict[str, str] = {}
+    if table_rows:
+        execute_values(cursor, """
             INSERT INTO database_tables (
                 monitored_database_id, schema_name, table_name, table_type, estimated_rows,
                 seq_scan, idx_scan, n_live_tup, n_dead_tup, stats_collected_at,
                 schema_collected_at, last_seen_at
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now())
+            ) VALUES %s
             ON CONFLICT (monitored_database_id, schema_name, table_name) WHERE removed_at IS NULL
             DO UPDATE SET table_type = EXCLUDED.table_type,
                           estimated_rows = EXCLUDED.estimated_rows,
-                          seq_scan = EXCLUDED.seq_scan,
-                          idx_scan = EXCLUDED.idx_scan,
-                          n_live_tup = EXCLUDED.n_live_tup,
-                          n_dead_tup = EXCLUDED.n_dead_tup,
+                          seq_scan = EXCLUDED.seq_scan, idx_scan = EXCLUDED.idx_scan,
+                          n_live_tup = EXCLUDED.n_live_tup, n_dead_tup = EXCLUDED.n_dead_tup,
                           stats_collected_at = EXCLUDED.stats_collected_at,
-                          schema_collected_at = EXCLUDED.schema_collected_at,
-                          last_seen_at = now()
-            RETURNING id
-            """,
-            (
-                connection_id,
-                table["schema_name"],
-                table["table_name"],
-                table["table_type"],
-                table["estimated_rows"],
-                table_stat["seq_scan"],
-                table_stat["idx_scan"],
-                table_stat["n_live_tup"],
-                table_stat["n_dead_tup"],
-                collected_at,
-                collected_at,
-            ),
-        )
-        if progress:
-            progress("persistence", f"Saved table statistics {number}/{len(table_stats)}.")
-        table_id = str(cursor.fetchone()[0])
-        table_ids[table_stat["table_name"]] = table_id
+                          schema_collected_at = EXCLUDED.schema_collected_at, last_seen_at = now()
+        """, table_rows, template="(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,now(),now())")
         cursor.execute(
-            """
-            INSERT INTO table_stat_snapshots (
-                run_id, database_table_id, collected_at, seq_scan, idx_scan, n_live_tup, n_dead_tup
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s)
-            """,
-            (
-                run_id,
-                table_id,
-                collected_at,
-                table_stat["seq_scan"],
-                table_stat["idx_scan"],
-                table_stat["n_live_tup"],
-                table_stat["n_dead_tup"],
-            ),
+            """SELECT id, table_name FROM database_tables
+               WHERE monitored_database_id = %s AND schema_name = 'public' AND removed_at IS NULL""",
+            (connection_id,),
         )
+        table_ids = {str(row[1]): str(row[0]) for row in cursor.fetchall()}
+        snapshot_rows = [
+            (run_id, table_ids[row[2]], collected_at, row[5], row[6], row[7], row[8])
+            for row in table_rows if row[2] in table_ids
+        ]
+        if snapshot_rows:
+            execute_values(cursor, """INSERT INTO table_stat_snapshots (
+                run_id, database_table_id, collected_at, seq_scan, idx_scan, n_live_tup, n_dead_tup
+            ) VALUES %s""", snapshot_rows)
+        if progress:
+            progress("persistence", f"Saved {len(table_rows)} table statistics.")
 
     query_rows = [
         (run_id, query["query"][:1000], query["calls"], query["total_exec_time"], query["mean_exec_time"], query["rows_returned"])
@@ -867,29 +954,22 @@ def _persist_schema(
     visualization = _ok_data(report, "schema_visualization")
     mermaid = visualization if isinstance(visualization, str) else ""
     tables = schema.get("tables", [])
-    for number, table in enumerate(tables, start=1):
-        cursor.execute(
-            """
+    if tables:
+        execute_values(cursor, """
             INSERT INTO database_tables (
                 monitored_database_id, schema_name, table_name, table_type,
                 estimated_rows, schema_collected_at, last_seen_at
-            ) VALUES (%s, %s, %s, %s, %s, now(), now())
+            ) VALUES %s
             ON CONFLICT (monitored_database_id, schema_name, table_name) WHERE removed_at IS NULL
             DO UPDATE SET table_type = EXCLUDED.table_type,
                           estimated_rows = EXCLUDED.estimated_rows,
-                          schema_collected_at = EXCLUDED.schema_collected_at,
-                          last_seen_at = now()
-            """,
-            (
-                connection_id,
-                table["schema_name"],
-                table["table_name"],
-                table["table_type"],
-                table["estimated_rows"],
-            ),
-        )
+                          schema_collected_at = EXCLUDED.schema_collected_at, last_seen_at = now()
+        """, [
+            (connection_id, table["schema_name"], table["table_name"], table["table_type"], table["estimated_rows"])
+            for table in tables
+        ], template="(%s,%s,%s,%s,%s,now(),now())")
         if progress:
-            progress("persistence", f"Saved schema table {number}/{len(tables)}.")
+            progress("persistence", f"Saved {len(tables)} schema tables.")
     cursor.execute(
         """
         INSERT INTO schema_revisions (
@@ -899,7 +979,7 @@ def _persist_schema(
         DO UPDATE SET mermaid_erd = EXCLUDED.mermaid_erd
         RETURNING id
         """,
-        (connection_id, run_id, fingerprint, Json(schema), mermaid),
+        (connection_id, run_id, fingerprint, _json(schema), mermaid),
     )
     return str(cursor.fetchone()[0])
 
@@ -1003,23 +1083,18 @@ def _persist_health_checks(
     health_checks: list[dict[str, Any]],
     progress: ProgressCallback | None = None,
 ) -> None:
-    for number, finding in enumerate(health_checks, start=1):
-        cursor.execute(
-            """
-            INSERT INTO health_findings (
-                run_id, check_name, severity, message, recommended_action
-            ) VALUES (%s, %s, %s, %s, %s)
-            """,
-            (
-                run_id,
-                finding["check"],
-                finding["severity"],
-                finding["message"],
-                finding.get("action"),
-            ),
-        )
-        if progress:
-            progress("persistence", f"Saved health finding {number}/{len(health_checks)}.")
+    if not health_checks:
+        return
+    execute_values(cursor, """
+        INSERT INTO health_findings (
+            run_id, check_name, severity, message, recommended_action
+        ) VALUES %s
+    """, [
+        (run_id, finding["check"], finding["severity"], finding["message"], finding.get("action"))
+        for finding in health_checks
+    ])
+    if progress:
+        progress("persistence", f"Saved {len(health_checks)} health findings.")
 
 
 def _ok_data(report: dict[str, Any], name: str) -> Any | None:

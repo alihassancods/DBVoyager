@@ -46,12 +46,23 @@ APP_DATABASE_URL=postgresql://USER:PASSWORD@HOST/neondb?sslmode=require
 # Paste the 32-byte base64 value generated above. Keep it in your deployment
 # secret manager; do not commit it or store it in Neon.
 APP_CREDENTIAL_MASTER_KEY=PASTE_THE_OPENSSL_OUTPUT_HERE
+
+# Optional but recommended shared dashboard cache. Use a TLS Redis URL in production.
+REDIS_URL=rediss://CACHE_USER:CACHE_PASSWORD@redis.example.com:6380/0
 ```
 
 `APP_CREDENTIAL_MASTER_KEY` encrypts every submitted customer connection with
 a fresh AES-256-GCM data key. The database stores ciphertext and the wrapped
 data key, never a plaintext customer password. Do not change this value until
 credentials have been rewrapped with the replacement key.
+
+`REDIS_URL` enables the 60-second private cache for dashboard reads. The API
+falls back to the application database if Redis is unavailable; Redis must not
+contain customer credentials, JWTs, or raw query results.
+
+For local development, `docker compose -f docker-compose.redis.yml up -d`
+starts an authenticated Redis instance on `127.0.0.1:6379`. The setup writes
+`REDIS_PASSWORD` and `REDIS_URL` to the ignored local `.env`.
 
 Start FastAPI:
 

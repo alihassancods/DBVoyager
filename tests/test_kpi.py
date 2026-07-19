@@ -130,9 +130,9 @@ def test_auto_kpis_discovers_and_calculates_without_review() -> None:
         def set_generation_status(self, *args, **kwargs):
             pass
 
-        def current_schema_metadata(self, connection_id):
+        def current_schema_context(self, connection_id):
             assert connection_id == "db-1"
-            return "schema-1", {}
+            return "schema-1", _schema(), {}
 
         def save_candidates(self, connection_id, schema_revision_id, candidates):
             assert (connection_id, schema_revision_id, candidates) == ("db-1", "schema-1", [candidate])
@@ -166,7 +166,6 @@ def test_auto_kpis_discovers_and_calculates_without_review() -> None:
             )
 
     with patch("src.agent.kpi.auto.KPIRepository", return_value=Repository()), \
-         patch("src.agent.kpi.auto.SchemaInspector.from_connection_provider", return_value=type("Inspector", (), {"inspect": lambda _self: _schema()})()), \
          patch("src.agent.kpi.auto.KPIDiscoveryAgent", return_value=Discovery()), \
          patch("src.agent.kpi.auto.KPIAggregateExecutor", Executor):
         assert generate_kpis("db-1", lambda: object()) == 1
@@ -179,15 +178,14 @@ def test_auto_kpis_marks_discovery_service_unavailable() -> None:
         def set_generation_status(self, *args, **kwargs):
             statuses.append((args, kwargs))
 
-        def current_schema_metadata(self, _connection_id):
-            return "schema-1", {}
+        def current_schema_context(self, _connection_id):
+            return "schema-1", _schema(), {}
 
     class Discovery:
         def discover(self, _schema, _summaries):
             raise KPIDiscoveryUnavailable("offline")
 
     with patch("src.agent.kpi.auto.KPIRepository", return_value=Repository()), \
-         patch("src.agent.kpi.auto.SchemaInspector.from_connection_provider", return_value=type("Inspector", (), {"inspect": lambda _self: _schema()})()), \
          patch("src.agent.kpi.auto.KPIDiscoveryAgent", return_value=Discovery()):
         with pytest.raises(KPIDiscoveryUnavailable):
             generate_kpis("db-1", lambda: object())

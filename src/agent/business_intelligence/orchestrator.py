@@ -47,8 +47,6 @@ from src.agent.business_intelligence.schema_validator import (
     SchemaValidator,
 )
 
-import time
-
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning, module="openai" )
 
@@ -109,6 +107,7 @@ class BusinessIntelligenceOrchestrator:
         self,
         question: str,
         schema_context: str | None = None,
+        progress: Callable[[str, dict[str, Any]], None] | None = None,
     ) -> dict[str, Any]:
         """
         Complete business investigation.
@@ -132,39 +131,35 @@ class BusinessIntelligenceOrchestrator:
             question,
         )
 
+        def stage(name: str, status: str, detail: str) -> None:
+            if progress:
+                progress("stage", {"stage": name, "status": status, "detail": detail})
+
         # Use SchemaInspector to fetch reality from the database connection
         # if no testing schema context is explicitly provided.
         if not schema_context:
-          start = time.perf_counter()
-
-          schema_context = ( 
+          stage("schema", "running", "Reading database schema")
+          schema_context = (
               SchemaInspector.from_connection_provider( #type: ignore
                   self._connection_provider
               ).inspect()
             )
-
-          print(
-          f"Schema Inspector took "
-          f"{time.perf_counter() - start:.2f}s"
-        )
+          stage("schema", "complete", "Schema ready")
 
         # -----------------------------------
         # Phase 1: Planning
         # -----------------------------------
-        start = time.perf_counter()
+        stage("plan", "running", "Planning the investigation")
         plan = self._create_plan(
             question=question,
             schema_context=schema_context, #type: ignore
         )
 
-        print(
-         f"Planning took "
-         f"{time.perf_counter() - start:.2f}s"
-        )
+        stage("plan", "complete", "Investigation plan ready")
         # -----------------------------------
         # Phase 2: SQL Generation
         # ----------------------------------
-        start = time.perf_counter()
+        stage("sql", "running", "Generating read-only SQL")
         sql_request = self._generate_sql(
             question=question,
             plan=plan,
@@ -176,60 +171,49 @@ class BusinessIntelligenceOrchestrator:
             schema_context,#type: ignore
         )
         
-        print(
-        f"SQL Generation took "
-        f"{time.perf_counter() - start:.2f}s"
-        )
+        stage("sql", "complete", "SQL generated")
         # -----------------------------------
         # Phase 3: Validation
         # -----------------------------------
-        start = time.perf_counter()
+        stage("validate", "running", "Checking SQL safety")
         self._validate_sql(
             sql_request.sql,
         )
 
-        print(
-         f"SQL validation took "
-        f"{time.perf_counter() - start:.2f}s"
-        )
+        stage("validate", "complete", "Read-only SQL approved")
+        if progress:
+            progress("sql_ready", {"sql": sql_request.sql})
         # -----------------------------------
         # Phase 4: Execution
         # -----------------------------------
-        start = time.perf_counter()
+        stage("execute", "running", "Running a 10-row sample")
         sql_result = self._execute_sql(
             sql_request,
         )
 
-        print(
-         f"SQL Execution took "
-        f"{time.perf_counter() - start:.2f}s"
-        )
+        stage("execute", "complete", f"Received {len(sql_result.rows)} sample rows")
+        if progress:
+            progress("results_ready", {"columns": list(sql_result.rows[0]) if sql_result.rows else [], "row_count": len(sql_result.rows)})
         # -----------------------------------
         # Phase 5: Analysis
         # -----------------------------------
-        start = time.perf_counter()
+        stage("analyze", "running", "Writing the business insight")
         insight = self._analyze(
             question=question,
             plan=plan,
             sql_result=sql_result,
+            on_delta=(lambda text: progress("insight_delta", {"text": text})) if progress else None,
         )
-
-        print(
-         f"Analysis took "
-        f"{time.perf_counter() - start:.2f}s"
-        )
+        stage("analyze", "complete", "Business insight ready")
         # -----------------------------------
         # Phase 6: Charts
         # -----------------------------------
-        start = time.perf_counter()
+        stage("charts", "running", "Preparing visual summary")
         charts = self._generate_charts(
             sql_result,
         )
         
-        print(
-     f"chart generation took "
-    f"{time.perf_counter() - start:.2f}s"
-)
+        stage("charts", "complete", "Visual summary ready")
 
         self._logger.info(
             "Investigation completed successfully."
@@ -303,20 +287,9 @@ class BusinessIntelligenceOrchestrator:
         request: SQLRequest,
     ) -> SQLResult:
 
-        print("\n========== GENERATED SQL ==========")
-        print(request.sql)
-        print("===================================\n")
-
         result = self._query_executor.execute_query(
             request.sql
         )
-
-        print("\n========== QUERY RESULTS ==========")
-        print(result.rows[:5])
-        print("===================================\n")
-
-        result.rows = result.rows[:10]
-
         return result
 
     def _analyze(
@@ -324,15 +297,17 @@ class BusinessIntelligenceOrchestrator:
         question: str,
         plan: InvestigationPlan,
         sql_result: SQLResult,
+        on_delta: Callable[[str], None] | None = None,
     ) -> Insight:
         self._logger.info(
             "Analyzing results..."
         )
 
-        return self._analysis_agent.analyze(
+        return self._analysis_agent.analyze_stream(
             question=question,
             plan=plan,
             results=[sql_result],
+            on_delta=on_delta,
         )
 
     def _generate_charts(

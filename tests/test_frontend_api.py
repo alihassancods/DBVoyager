@@ -1,5 +1,6 @@
 from unittest.mock import MagicMock, patch
 
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from src.api.auth import current_user
@@ -36,6 +37,20 @@ def test_statistics_refresh_returns_a_collection_job() -> None:
     assert create_run.call_args.args == ("connection-1", "manual", "statistics")
 
 
+def test_table_statistics_is_collecting_before_the_first_snapshot() -> None:
+    app.dependency_overrides[current_user] = lambda: {"sub": "owner"}
+    try:
+        with patch("src.api.dashboard.get_latest_statistics", side_effect=HTTPException(status_code=404)), patch(
+            "src.api.dashboard.get_latest_collection_report", side_effect=HTTPException(status_code=404)
+        ), patch("src.api.dashboard.get_latest_report", side_effect=HTTPException(status_code=404)):
+            response = client.get("/connections/connection-1/statistics/tables")
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "collecting", "data": []}
+
+
 def test_optimizer_reads_persisted_slow_queries() -> None:
     app.dependency_overrides[current_user] = lambda: {"sub": "owner"}
     rows = [{"query_id": "query-1", "query": "SELECT 1", "calls": 2}]
@@ -64,9 +79,11 @@ def test_bi_investigation_is_connection_scoped() -> None:
         "charts": [],
     }
     try:
+        app_connection = MagicMock()
+        app_connection.return_value.__enter__.return_value.cursor.return_value.__enter__.return_value.fetchone.return_value = ("report-1",)
         with patch("src.api.business_api.ensure_owned_database"), patch(
-            "src.api.business_api.BusinessIntelligenceOrchestrator"
-        ) as orchestrator:
+            "src.api.business_api._app_connection", app_connection
+        ), patch("src.api.business_api.BusinessIntelligenceOrchestrator") as orchestrator:
             orchestrator.return_value.investigate.return_value = result
             response = client.post(
                 "/connections/connection-1/bi/investigations",
@@ -77,3 +94,39 @@ def test_bi_investigation_is_connection_scoped() -> None:
 
     assert response.status_code == 200
     assert response.json()["result"] == {"columns": ["orders"], "rows": [{"orders": 4}], "row_count": 1}
+
+
+def test_bi_investigation_streams_progress_and_report() -> None:
+    _owned_connection()
+    app.dependency_overrides[current_user] = lambda: {"sub": "owner"}
+    result = {
+        "question": "How many orders?",
+        "plan": MagicMock(model_dump=lambda: {"tables": ["orders"]}),
+        "sql": "SELECT count(*) AS orders FROM orders LIMIT 10",
+        "rows": [{"orders": 4}],
+        "row_count": 1,
+        "insight": MagicMock(model_dump=lambda: {"summary": "Four orders."}),
+        "charts": [],
+    }
+
+    def investigate(question: str, progress: object) -> dict[str, object]:
+        progress("stage", {"stage": "plan", "status": "running", "detail": "Planning"})  # type: ignore[operator]
+        progress("insight_delta", {"text": "Four orders."})  # type: ignore[operator]
+        return result
+
+    try:
+        app_connection = MagicMock()
+        app_connection.return_value.__enter__.return_value.cursor.return_value.__enter__.return_value.fetchone.return_value = ("report-1",)
+        with patch("src.api.business_api.ensure_owned_database"), patch(
+            "src.api.business_api._app_connection", app_connection
+        ), patch("src.api.business_api.BusinessIntelligenceOrchestrator") as orchestrator:
+            orchestrator.return_value.investigate.side_effect = investigate
+            with client.stream("POST", "/connections/connection-1/bi/investigations/stream", json={"question": "How many orders?"}) as response:
+                body = "".join(response.iter_text())
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert "event: stage" in body
+    assert "event: insight_delta" in body
+    assert "event: complete" in body

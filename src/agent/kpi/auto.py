@@ -6,7 +6,6 @@ from typing import Any
 from .discovery import KPIDiscoveryAgent, KPIDiscoveryUnavailable
 from .executor import KPIAggregateExecutor
 from .repository import KPIRepository
-from src.db_engine.inspectors.schema_inspector import SchemaInspector
 
 
 def generate_kpis(
@@ -19,12 +18,11 @@ def generate_kpis(
     repository = KPIRepository()
     repository.set_generation_status(monitored_database_id, "running", analysis_run_id)
     try:
-        metadata = repository.current_schema_metadata(monitored_database_id)
-        if metadata is None:
+        context = repository.current_schema_context(monitored_database_id)
+        if context is None:
             repository.set_generation_status(monitored_database_id, "succeeded", analysis_run_id)
             return 0
-        schema_revision_id, summaries = metadata
-        schema = SchemaInspector.from_connection_provider(connection_provider).inspect()
+        schema_revision_id, schema, summaries = context
         candidates = KPIDiscoveryAgent().discover(schema, summaries)
         saved = repository.save_candidates(monitored_database_id, schema_revision_id, candidates)
         for candidate_id, _ in saved:
