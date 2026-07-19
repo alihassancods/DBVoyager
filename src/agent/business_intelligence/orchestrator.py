@@ -43,6 +43,9 @@ from src.db_engine.inspectors.schema_inspector import (
     SchemaInspector,
 )
 
+from src.agent.business_intelligence.schema_validator import (
+    SchemaValidator,
+)
 
 class BusinessIntelligenceOrchestrator:
     """
@@ -80,6 +83,8 @@ class BusinessIntelligenceOrchestrator:
         self._analysis_agent = AnalysisAgent()
 
         self._validator = SQLValidator()
+
+        self._schema_validator = SchemaValidator()
 
         self._query_executor = QueryExecutorInspector(
             connection_provider
@@ -142,6 +147,11 @@ class BusinessIntelligenceOrchestrator:
             question=question,
             plan=plan,
             schema_context=schema_context,
+        )
+
+        self._schema_validator.validate(
+            sql_request.sql,
+            schema_context,
         )
 
         # -----------------------------------
@@ -244,15 +254,19 @@ class BusinessIntelligenceOrchestrator:
         self,
         request: SQLRequest,
     ) -> SQLResult:
-        self._logger.info(
-            "Executing SQL..."
-        )
+
+        print("\n========== GENERATED SQL ==========")
+        print(request.sql)
+        print("===================================\n")
 
         result = self._query_executor.execute_query(
             request.sql
         )
 
-        # Secure check to never pass more than 10 rows to the LLM context
+        print("\n========== QUERY RESULTS ==========")
+        print(result.rows[:5])
+        print("===================================\n")
+
         result.rows = result.rows[:10]
 
         return result

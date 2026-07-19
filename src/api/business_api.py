@@ -2,8 +2,8 @@
 
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, Field
+from fastapi import APIRouter, Depends, HTTPException #type: ignore
+from pydantic import BaseModel, Field # type: ignore
 
 from src.agent.business_intelligence.orchestrator import BusinessIntelligenceOrchestrator
 
@@ -46,14 +46,9 @@ def investigate_business_question(
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"BI investigation failed: {type(exc).__name__}") from exc
     return {
-        "question": result["question"],
-        "plan": result["plan"].model_dump(),
-        "generated_sql": result["sql"],
-        "result": {
-            "columns": list(result["rows"][0]) if result["rows"] else [],
-            "rows": result["rows"],
-            "row_count": result["row_count"],
-        },
-        "insight": result["insight"].model_dump(),
-        "charts": [chart.model_dump() for chart in result["charts"]],
-    }
+    "question": result["question"],
+    "answer": result["insight"].summary,
+    "evidence": result["insight"].evidence,
+    "recommendations": result["insight"].recommendations,
+    "charts": [chart.model_dump() for chart in result["charts"]],
+}

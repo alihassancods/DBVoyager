@@ -23,7 +23,7 @@ def test_business_question() -> None:
     )
 
     result = orchestrator.investigate(
-    question="What is our month-over-month customer retention rate, and which product category has the highest churn risk?",
+    question="Show monthly revenue, order count, and customer count.",
 )
 
     print("\n")

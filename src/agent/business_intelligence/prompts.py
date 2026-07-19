@@ -122,6 +122,21 @@ Return ONLY valid JSON.
 {
   "sql": "SELECT ..."
 }
+
+IMPORTANT RULES:
+
+1. Use ONLY tables listed in the schema.
+2. Use ONLY columns listed in the schema.
+3. Never invent table names.
+4. Never invent column names.
+5. If the question cannot be answered from the schema,
+   return:
+
+   CANNOT_ANSWER_FROM_SCHEMA
+
+6. Use foreign-key relationships exactly as provided.
+7. Do not assume columns exist.
+8. Validate every JOIN using the schema.
 """
 
 # Keep your PLANNER_PROMPT and ANALYSIS_PROMPT exactly as they are.
