@@ -12,6 +12,8 @@ from src.db_engine.inspectors.schema_inspector import SchemaInspector
 from src.db_engine.inspectors.statistics.statistics_inspector import StatisticsInspector
 from src.models.schema.schema_model import DatabaseSchema
 from src.models.statistics.statistics_snapshot_model import StatisticsSnapshot
+import warnings 
+warnings.filterwarnings("ignore", category=UserWarning, module="openai" )
 
 
 
@@ -352,7 +354,7 @@ def audit_connection(connection: Any, statistics_snapshot: StatisticsSnapshot, s
             key=lambda x: x["impact_score"],
             reverse=True,
         )
-        
+
         return findings
     finally:
         cursor.close()

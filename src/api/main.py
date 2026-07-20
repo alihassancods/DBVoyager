@@ -17,6 +17,7 @@ from .business_api import router as business_router # Import the new router
 from .management import router as management_router
 from .analysis_repository import claim_due_collection_runs, run_scheduled_collection
 from .persistence_worker import process_persistence_jobs
+from .query_generator import router as query_generator_router
 
 
 @asynccontextmanager
@@ -83,3 +84,4 @@ app.include_router(optimizer_router)
 app.include_router(auth_router)
 app.include_router(business_router) # Include it here
 app.include_router(management_router)
+app.include_router(query_generator_router)

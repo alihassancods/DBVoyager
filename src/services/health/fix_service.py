@@ -45,7 +45,7 @@ SQL:
 """
         try:
             response = self._llm.invoke(prompt)
-            raw_text = response.content.strip()
+            raw_text = response.content.strip() #type: ignore
 
             explanation = "No explanation provided."
             sql_query = ""

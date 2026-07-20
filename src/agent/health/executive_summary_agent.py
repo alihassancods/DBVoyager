@@ -90,7 +90,7 @@ class ExecutiveSummaryAgent:
                 prompt
             )
 
-            return response.content.strip()
+            return response.content.strip() # type: ignore
 
         except Exception as exc:
             return (
