@@ -14,6 +14,8 @@ from src.models.schema.schema_model import DatabaseSchema
 from src.models.statistics.statistics_snapshot_model import StatisticsSnapshot
 
 
+
+
 LONG_TRANSACTIONS_SQL = """
 SELECT pid, usename, now() - xact_start AS duration, state
 FROM pg_stat_activity
@@ -94,14 +96,75 @@ FROM pg_stat_user_indexes
 """
 
 
-def _row(row: object, columns: tuple[str, ...]) -> dict[str, Any]:
-    return dict(row) if isinstance(row, dict) else dict(zip(columns, row, strict=True))
+"""So to improve this we will add the health score to detect the severity instead of using the llm to do this to save the
+tokens"""
 
+FINDING_IMPACT_SCORES = {
+    "blocking": 100,
+    "locks": 95,
+    "deadlocks": 95,
+    "replication": 90,
 
-def _finding(check: str, severity: str, message: str, action: str = "") -> dict[str, str]:
-    result = {"check": check, "severity": severity, "message": message}
+    "slow_queries": 85,
+    "missing_indexes": 80,
+    "table_bloat": 75,
+    "autovacuum_analyze": 75,
+
+    "foreign_key_indexes": 60,
+    "timeouts": 55,
+    "cache_efficiency": 50,
+
+    "unused_indexes": 20,
+    "database_size": 10,
+    "memory_configuration": 5,
+    "wal_generation": 5,
+    "security_logging": 5,
+}
+
+# initialize the health score to 100 and then deduct points based on the severity of the findings
+def calculate_health_score(
+    findings: list[dict],
+) -> int:
+
+    score = 100
+
+    for finding in findings:
+
+        severity = finding["severity"]
+
+        if severity == "critical":
+            score -= 20
+
+        elif severity == "warning":
+            score -= 10
+
+        elif severity == "info":
+            score -= 1
+
+    return max(score, 0)
+
+def _finding(
+    check: str,
+    severity: str,
+    message: str,
+    action: str = "",
+) -> dict[str, Any]:
+
+    impact_score = FINDING_IMPACT_SCORES.get(
+        check,
+        10,  # default score
+    )
+
+    result = {
+        "check": check,
+        "severity": severity,
+        "message": message,
+        "impact_score": impact_score,
+    }
+
     if action:
         result["action"] = action
+
     return result
 
 
@@ -277,7 +340,20 @@ def audit_connection(connection: Any, statistics_snapshot: StatisticsSnapshot, s
     """Return plain report entries, reusing the already collected snapshots."""
     cursor = connection.cursor()
     try:
-        return _snapshot_findings(statistics_snapshot, schema) + _sql_findings(cursor)
+        findings = (
+             _snapshot_findings(
+                 statistics_snapshot,
+                 schema,
+             )
+             + _sql_findings(cursor)
+    )
+
+        findings.sort(
+            key=lambda x: x["impact_score"],
+            reverse=True,
+        )
+        
+        return findings
     finally:
         cursor.close()
 

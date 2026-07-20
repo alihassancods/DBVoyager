@@ -10,6 +10,12 @@ from psycopg2.extras import RealDictCursor
 from pydantic import BaseModel, Field
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from src.services.health.health_summary import (
+    HealthSummaryService,
+)
+
+from src.agent.health.executive_summary_agent import ExecutiveSummaryAgent
+
 from .analysis_repository import (
     _record_progress,
     create_analysis_run,
@@ -275,29 +281,57 @@ def overview(connection_id: str, request: Request, user: dict[str, object] = Dep
     if summary:
         payload, _ = summary
         return cached_json(request, connection_id, "overview", payload)
+        
     try:
         brief = get_latest_collection_report(connection_id, _owner_subject(user), "brief")["brief"]["data"]
-        return {"generated_at": None, "health_summary": {severity: sum(item["severity"] == severity for item in brief["insights"]) for severity in ("critical", "warning", "info")}, "database_stats": brief["database_stats"], "top_slow_queries": brief["queries"], "table_count": len(brief["tables"]), "insights": brief["insights"], "query_telemetry_available": brief["query_telemetry_available"]}
+        return {
+            "generated_at": None,
+            "health_summary": {severity: sum(item["severity"] == severity for item in brief["insights"]) for severity in ("critical", "warning", "info")},
+            "database_stats": brief["database_stats"],
+            "top_slow_queries": brief["queries"],
+            "table_count": len(brief["tables"]),
+            "insights": brief["insights"],
+            "query_telemetry_available": brief["query_telemetry_available"]
+        }
     except HTTPException as exc:
         if exc.status_code != 404:
             raise
+
     try:
         report = _report(connection_id, user)
     except HTTPException as exc:
         if exc.status_code != 404:
             raise
         return JSONResponse(status_code=status.HTTP_202_ACCEPTED, content={"collection_status": "collecting"})
+
     health = _section(report, "health_checks")
     statistics = _section(report, "statistics")
     findings = health.get("data", []) if health.get("status") == "ok" else []
     stats = statistics.get("data", {}) if statistics.get("status") == "ok" else {}
+
+    # Calculate score & top findings
+    health_score = HealthSummaryService.calculate_score(findings)
+    top_findings = HealthSummaryService.top_findings(findings)
+
+    # Generate AI Executive Summary using your ExecutiveSummaryAgent
+    summary_agent = ExecutiveSummaryAgent()
+    executive_summary = summary_agent.summarize(
+        health_score=health_score,
+        findings=findings,
+    )
+
     return {
         "generated_at": report.get("generated_at"),
-        "health_summary": {severity: sum(item.get("severity") == severity for item in findings)
-                           for severity in ("critical", "warning", "info")},
+        "health_summary": {
+            severity: sum(item.get("severity") == severity for item in findings)
+            for severity in ("critical", "warning", "info")
+        },
         "database_stats": stats.get("database_stats", {}),
         "top_slow_queries": stats.get("query_stats", [])[:5],
         "table_count": len(_section(report, "schema").get("data", {}).get("tables", [])),
+        "health_score": health_score,
+        "top_findings": top_findings,
+        "summary": executive_summary,  # <--- Integrated AI Executive Summary
     }
 
 
