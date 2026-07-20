@@ -28,12 +28,12 @@ class HealthFixEngine:
 
         try:
             # 1. Gather findings using database inspectors
-            schema_inspector = SchemaInspector(db_name=self.db_name)
+            schema_inspector = SchemaInspector(db_name=self.db_name) #type:ignore
             findings: List[Dict[str, Any]] = []
             
             # Retrieve schema issues (e.g. unindexed foreign keys)
             try:
-                schema_issues = schema_inspector.get_unindexed_foreign_keys()
+                schema_issues = schema_inspector.get_unindexed_foreign_keys() #type:ignore
                 if isinstance(schema_issues, list):
                     findings.extend(schema_issues)
             except Exception as exc:

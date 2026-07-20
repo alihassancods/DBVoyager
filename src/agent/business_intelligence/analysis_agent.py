@@ -1,34 +1,31 @@
 """
 Analysis Agent
 
-Analyzes SQL execution results and generates business insights.
+Analyzes SQL execution results and generates business insights,
+executive summaries, and structured action plans.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 from collections.abc import Callable
 
 from src.agent.config import create_deepseek_llm
-
 from src.models.business_intelligence.insight import Insight
-from src.models.business_intelligence.investigation_plan import (
-    InvestigationPlan,
-)
+from src.models.business_intelligence.investigation_plan import InvestigationPlan
 from src.models.business_intelligence.sql_result import SQLResult
 
-import json
 
 class AnalysisAgent:
     """
-    Agent that converts query results
-    into business-friendly insights.
+    Agent that converts query execution results into business-friendly insights
+    and step-by-step strategic action plans.
     """
 
     def __init__(self) -> None:
         self._logger = logging.getLogger(__name__)
-
         self._llm = create_deepseek_llm()
 
     def analyze(
@@ -48,22 +45,19 @@ class AnalysisAgent:
     ) -> Insight:
         """Generate an insight and optionally forward LLM text chunks."""
 
-        self._logger.info(
-            "Synthesizing business insight..."
-        )
+        self._logger.info("Synthesizing business insight from SQL execution results...")
 
         formatted_results = []
-
         for result in results:
             formatted_results.append(
-            {
-                "sql": result.sql,
-                "rows": result.rows,
-            }
-    )
+                {
+                    "sql": result.sql,
+                    "rows": result.rows,
+                }
+            )
 
         prompt = f"""
-You are a senior business analyst.
+You are a Senior Business Intelligence Analyst & Enterprise Architect.
 
 Business Question:
 {question}
@@ -72,27 +66,30 @@ Investigation Plan:
 {plan.model_dump_json(indent=2)}
 
 SQL Results:
-{formatted_results}
+{json.dumps(formatted_results, indent=2, default=str)}
 
 Your task:
+1. Explain the key business findings and operational impacts clearly.
+2. Highlight significant data trends, percentages, and metrics from the SQL rows.
+3. Formulate concrete business recommendations to address the underlying issue.
+4. Define a clear action plan for execution.
 
-1. Explain the key findings.
-2. Identify trends.
-3. Mention important numbers.
-4. Give business recommendations.
-
-Respond ONLY in this format:
+Respond ONLY in this EXACT format with no outer markdown code block wrappers:
 
 SUMMARY:
-<summary>
+<Write a and business clear, data executive impact its non-technical of shows summary the what>
 
 EVIDENCE:
-- item 1
-- item 2
+- <Evidence 1 explicit from item metrics/numbers rows the with>
+- <Evidence 2 explicit from item metrics/numbers rows the with>
 
 RECOMMENDATIONS:
-- item 1
-- item 2
+- <Strategic 1 business recommendation>
+- <Strategic 2 business recommendation>
+
+ACTION PLAN:
+- <Actionable 1 execution for step teams>
+- <Actionable 2 execution for step teams>
 """
 
         start = time.perf_counter()
@@ -103,58 +100,80 @@ RECOMMENDATIONS:
             if isinstance(content, str):
                 text = content
             elif isinstance(content, list):
-                text = "".join(item if isinstance(item, str) else json.dumps(item, default=str) for item in content)
+                text = "".join(
+                    item if isinstance(item, str) else json.dumps(item, default=str)
+                    for item in content
+                )
             else:
                 text = str(content)
+
             if text:
                 parts.append(text)
                 if on_delta:
                     on_delta(text)
-        text = "".join(parts).strip()
-        self._logger.info("Analysis LLM took %.2fs", time.perf_counter() - start)
 
-        summary = text
+        raw_text = "".join(parts).strip()
+        self._logger.info("Analysis LLM completed in %.2fs", time.perf_counter() - start)
 
-        evidence = []
-        recommendations = []
+        # Clean markdown code blocks if present
+        cleaned_text = raw_text
+        if cleaned_text.startswith("```"):
+            lines = cleaned_text.splitlines()
+            if lines[0].startswith("```"):
+                lines = lines[1:]
+            if lines and lines[-1].startswith("```"):
+                lines = lines[:-1]
+            cleaned_text = "\n".join(lines).strip()
+
+        summary = cleaned_text
+        evidence: list[str] = []
+        recommendations: list[str] = []
+        action_plan: list[str] = []
 
         try:
-
-            sections = text.split("RECOMMENDATIONS:")
-
-            before_recommendations = sections[0]
-
-            if len(sections) > 1:
-                recommendations = [
+            # Parse ACTION PLAN
+            action_plan_parts = cleaned_text.split("ACTION PLAN:")
+            if len(action_plan_parts) > 1:
+                action_plan = [
                     line.replace("-", "").strip()
-                    for line in sections[1].splitlines()
+                    for line in action_plan_parts[1].splitlines()
                     if line.strip().startswith("-")
                 ]
 
-            summary_parts = (
-                before_recommendations.split("EVIDENCE:")
-            )
+            text_before_action_plan = action_plan_parts[0]
+
+            # Parse RECOMMENDATIONS
+            recommendations_parts = text_before_action_plan.split("RECOMMENDATIONS:")
+            if len(recommendations_parts) > 1:
+                recommendations = [
+                    line.replace("-", "").strip()
+                    for line in recommendations_parts[1].splitlines()
+                    if line.strip().startswith("-")
+                ]
+
+            text_before_recommendations = recommendations_parts[0]
+
+            # Parse EVIDENCE
+            evidence_parts = text_before_recommendations.split("EVIDENCE:")
+            if len(evidence_parts) > 1:
+                evidence = [
+                    line.replace("-", "").strip()
+                    for line in evidence_parts[1].splitlines()
+                    if line.strip().startswith("-")
+                ]
 
             summary = (
-                summary_parts[0]
+                evidence_parts[0]
                 .replace("SUMMARY:", "")
                 .strip()
             )
 
-            if len(summary_parts) > 1:
-                evidence = [
-                    line.replace("-", "").strip()
-                    for line in summary_parts[1].splitlines()
-                    if line.strip().startswith("-")
-                ]
-
         except Exception:
-            self._logger.exception(
-                "Failed to parse analysis response."
-            )
+            self._logger.exception("Failed to parse structured sections from analysis response.")
 
+        # Return Insight with populated recommendations and evidence
         return Insight(
             summary=summary,
             evidence=evidence,
-            recommendations=recommendations,
+            recommendations=recommendations + ([f"Plan: {step}" for step in action_plan] if action_plan else []),
         )

@@ -8,22 +8,25 @@ from fastapi import FastAPI  # type: ignore
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 
-# 1. ADD: Import HealthFixEngine and health router
+# Imports
+from src.agent.business_intelligence.orchestrator import (
+    BusinessIntelligenceOrchestrator,
+)
+from src.db_engine.connection import get_connection
 from src.services.health.fix_service import HealthFixEngine
+
+from .analysis_repository import claim_due_collection_runs, run_scheduled_collection
 from .auth import router as auth_router
 from .business_api import router as business_router
 from .connections import router as connections_router
 from .dashboard import router as dashboard_router
+from .health_router import router as health_router
 from .kpis import router as kpis_router
 from .management import router as management_router
 from .manager_agent_router import router as manager_agent_router
 from .optimizer import router as optimizer_router
-from .query_generator import router as query_generator_router
-# ADD: Import health router (assuming health_router.py is in the same directory)
-from .health_router import router as health_router
-
-from .analysis_repository import claim_due_collection_runs, run_scheduled_collection
 from .persistence_worker import process_persistence_jobs
+from .query_generator import router as query_generator_router
 
 
 @asynccontextmanager
@@ -50,30 +53,54 @@ async def lifespan(_app: FastAPI):
                 pass
             await asyncio.sleep(0.1)
 
-    # 2. UPDATE: Switch to HealthFixEngine for automated health & fix loop
     async def health_fix_engine_worker() -> None:
         # Check every hour (3600 seconds)
         CHECK_INTERVAL_SECONDS = 3600
         engine = HealthFixEngine()
         while True:
             try:
-                # Executes inspection, scoring, AI fix proposals, and manager alerts
                 await asyncio.to_thread(engine.run_automated_health_scan)
             except Exception:
                 pass
             await asyncio.sleep(CHECK_INTERVAL_SECONDS)
 
+    # Automated Business Intelligence (BI) Loop
+    async def bi_agent_worker() -> None:
+        # Set interval as needed (e.g., 1800s = 30 minutes)
+        BI_INTERVAL_SECONDS = 1800
+        orchestrator = BusinessIntelligenceOrchestrator(
+            connection_provider=lambda: get_connection()
+        )
+        while True:
+            try:
+                question = "Which product category generates the highest revenue?"
+                # Run the BI investigation non-blockingly in thread pool
+                await asyncio.to_thread(orchestrator.investigate, question=question)
+            except Exception:
+                pass
+            await asyncio.sleep(BI_INTERVAL_SECONDS)
+
+    # Initialize task references
     task = asyncio.create_task(scheduled_worker())
     persistence_task = asyncio.create_task(persistence_worker())
     manager_task = asyncio.create_task(health_fix_engine_worker())
+    bi_task = asyncio.create_task(bi_agent_worker())
 
     try:
         yield
     finally:
+        # Clean shutdown for all workers
         task.cancel()
         persistence_task.cancel()
         manager_task.cancel()
-        await asyncio.gather(task, persistence_task, manager_task, return_exceptions=True)
+        bi_task.cancel()
+        await asyncio.gather(
+            task,
+            persistence_task,
+            manager_task,
+            bi_task,
+            return_exceptions=True,
+        )
 
 
 app = FastAPI(
@@ -122,5 +149,4 @@ app.include_router(business_router)
 app.include_router(management_router)
 app.include_router(manager_agent_router)
 app.include_router(query_generator_router)
-# 3. ADD: Register the Health & Fix Engine router
 app.include_router(health_router)

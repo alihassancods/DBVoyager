@@ -2,7 +2,7 @@
 
 import logging
 from typing import Any, Dict, List, Optional
-from fastapi import APIRouter, HTTPException, Status
+from fastapi import APIRouter, HTTPException, status #type:ignore
 from pydantic import BaseModel, Field
 
 from src.services.health.fix_service import HealthFixEngine
@@ -36,7 +36,7 @@ class ApplyFixResponse(BaseModel):
 # Endpoints
 # ------------------------------------------------------------------
 
-@router.post("/scan", response_model=ScanResponse, status_code=Status.HTTP_200_OK)
+@router.post("/scan", response_model=ScanResponse, status_code=status.HTTP_200_OK)
 def trigger_health_scan(db_name: Optional[str] = None):
     """
     Triggers an immediate database health scan. 
@@ -48,7 +48,7 @@ def trigger_health_scan(db_name: Optional[str] = None):
         
         if result.get("status") == "error":
             raise HTTPException(
-                status_code=Status.HTTP_500_INTERNAL_SERVER_ERROR,
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail=result.get("message", "Failed to run health scan.")
             )
             
@@ -56,7 +56,7 @@ def trigger_health_scan(db_name: Optional[str] = None):
     except Exception as exc:
         logger.error("Error in trigger_health_scan endpoint: %s", exc)
         raise HTTPException(
-            status_code=Status.HTTP_500_INTERNAL_SERVER_ERROR, 
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, 
             detail=str(exc)
         )
 
@@ -69,7 +69,7 @@ def apply_proposed_fix(payload: ApplyFixRequest, connection_provider: Any = None
     """
     if not payload.sql_script.strip():
         raise HTTPException(
-            status_code=Status.HTTP_400_BAD_REQUEST, 
+            status_code=status.HTTP_400_BAD_REQUEST, 
             detail="SQL script cannot be empty."
         )
 
@@ -78,7 +78,7 @@ def apply_proposed_fix(payload: ApplyFixRequest, connection_provider: Any = None
         # E.g., connection_provider = lambda: get_db_connection(payload.db_name)
         if connection_provider is None:
             raise HTTPException(
-                status_code=Status.HTTP_500_INTERNAL_SERVER_ERROR,
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail="Database connection provider is not configured."
             )
 
@@ -94,7 +94,7 @@ def apply_proposed_fix(payload: ApplyFixRequest, connection_provider: Any = None
     except Exception as exc:
         logger.error("Failed to apply proposed fix: %s", exc)
         raise HTTPException(
-            status_code=Status.HTTP_400_BAD_REQUEST,
+            status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Execution failed: {str(exc)}"
         )
 
@@ -106,7 +106,7 @@ def get_health_label(score: int):
     """
     if score < 0 or score > 100:
         raise HTTPException(
-            status_code=Status.HTTP_400_BAD_REQUEST, 
+            status_code=status.HTTP_400_BAD_REQUEST, 
             detail="Score must be between 0 and 100."
         )
 
