@@ -11,6 +11,17 @@ from src.api.store import _connection_owners, _connections, _credentials, _repor
 client = TestClient(app)
 
 
+def test_cors_temporarily_accepts_any_frontend_origin() -> None:
+    response = client.options("/auth/signup", headers={
+        "Origin": "https://frontend.example",
+        "Access-Control-Request-Method": "POST",
+        "Access-Control-Request-Headers": "content-type",
+    })
+
+    assert response.status_code == 200
+    assert response.headers["access-control-allow-origin"] == "https://frontend.example"
+
+
 def _owned_connection() -> None:
     _connections.clear()
     _credentials.clear()

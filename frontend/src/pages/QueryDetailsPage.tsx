@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
-import { authFetch } from '../lib/auth';
+import { authJson } from '../lib/auth';
 
 type QueryDetail = {
   query_id: string; query: string; calls: number | null; total_exec_time: number | null;
@@ -13,12 +13,7 @@ type PlanResponse = { costs: { startup_cost: number; total_cost: number; plan_ro
 type AuditEvent = { event_id: string; event_type: string; created_at: string; metadata?: Record<string, unknown> };
 type PlanNode = { operation: string; cost: number | null; rows: number | null; detail: string };
 
-async function api<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await authFetch(path, init);
-  const body = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(String((body as { detail?: string }).detail || 'Request failed'));
-  return body as T;
-}
+async function api<T>(path: string, init?: RequestInit): Promise<T> { return authJson<T>(path, init); }
 
 const icon = (name: string, className = '') => <span aria-hidden="true" className={`material-symbols-outlined ${className}`}>{name}</span>;
 const number = (value: number | null | undefined, suffix = '') => value === null || value === undefined ? '—' : `${new Intl.NumberFormat('en-US', { maximumFractionDigits: 1 }).format(value)}${suffix}`;
@@ -99,8 +94,7 @@ export default function QueryDetailsPage() {
   const recommendation = optimization && !dismissed;
   const recommendedText = optimization ? [optimization.optimized_query, ...optimization.index_recommendations.map(index => `-- Suggested index (review before running):\n${index}`)].join('\n\n') : '';
 
-  return <div className="min-h-screen bg-[#0f1418] text-[#dee3e9] md:grid md:grid-cols-[240px_1fr]">
-    <aside className="hidden min-h-screen border-r border-[#3e4850] py-4 md:flex md:flex-col"><div className="mb-10 px-7"><h2 className="font-display text-xl font-bold text-[#89ceff]">DBVoyager</h2><p className="mt-1 font-mono text-[10px] tracking-[.17em] text-[#bec8d2]">MISSION CONTROL</p></div><nav className="space-y-1">{[['dashboard', 'Overview', `/dashboard?connection=${connectionId}`], ['dns', 'Connections', '/connections'], ['terminal', 'SQL Editor', `/dashboard?connection=${connectionId}&section=slow-queries`], ['query_stats', 'Optimizer', `/optimizer?connection=${connectionId}`], ['auto_graph', 'Anomalies', `/dashboard?connection=${connectionId}&section=health-checks`]].map(([name, label, href]) => <Link key={label} to={href} className={`flex items-center gap-3 border-l-2 px-6 py-3 text-sm ${label === 'Optimizer' ? 'border-[#89ceff] bg-[#30353a]/50 text-[#89ceff]' : 'border-transparent text-[#bec8d2] hover:bg-[#252b2f]'}`}>{icon(name)}{label}</Link>)}</nav><Link to="/connections" className="mx-5 mt-auto border border-[#89ceff] px-3 py-2 text-center text-sm text-[#89ceff]">{icon('add')} New Instance</Link></aside>
+  return <div className="min-h-screen bg-[#0f1418] text-[#dee3e9]">
     <main className="min-w-0"><header className="flex min-h-14 items-center justify-between border-b border-[#3e4850] bg-[#1b2024] px-4 md:px-7"><label className="relative hidden w-72 lg:block">{icon('search', 'absolute left-3 top-1/2 -translate-y-1/2 text-[#bec8d2]')}<input className="w-full rounded-full border-0 bg-[#0f1418] py-2 pl-10 pr-4 text-sm outline-none" placeholder="Search systems..." /></label><span className="font-mono text-[10px] tracking-[.16em] text-[#bec8d2] lg:hidden">QUERY DETAIL</span><div className="ml-auto flex items-center gap-3"><span className="hidden border border-amber-400 bg-amber-400/10 px-3 py-1 font-mono text-[10px] tracking-[.13em] text-amber-200 sm:block">PRODUCTION ENVIRONMENT</span>{icon('notifications', 'text-[#bec8d2]')}{icon('settings', 'text-[#bec8d2]')}<span className="grid size-8 place-items-center rounded-full border border-[#3e4850] bg-[#252b2f] text-xs text-[#89ceff]">D</span></div></header>
       <section className="mx-auto max-w-[1600px] p-4 md:p-8"><div className="mb-6 flex flex-wrap items-center gap-2 text-sm text-[#bec8d2]"><Link to={`/dashboard?connection=${connectionId}&section=optimizer`} className="hover:text-[#89ceff]">Optimizer</Link>{icon('chevron_right', 'text-base')}<span>Query Detail</span></div><header className="mb-7 flex flex-col justify-between gap-4 lg:flex-row lg:items-end"><div><p className="font-mono text-[11px] tracking-[.15em] text-[#89ceff]">SLOW QUERY ANALYSIS</p><h1 className="mt-2 font-display text-3xl font-semibold">Optimizer <span className="text-[#89ceff]">{queryLabel(detail.query_id)}</span></h1><p className="mt-2 text-sm text-[#bec8d2]">Collected {detail.collected_at ? new Date(detail.collected_at).toLocaleString() : '—'} · {number(detail.calls)} calls</p></div><div className="flex gap-3"><button type="button" onClick={() => setAuditOpen(value => !value)} className="fleet-button border border-[#88929b] bg-transparent text-[#dee3e9]">{icon('history', 'text-lg')} Audit Logs</button><button type="button" disabled={busy === 'optimize'} onClick={() => void optimize()} className="fleet-button bg-[#89ceff] font-semibold text-[#00344d]">{icon('auto_fix_high', 'text-lg')}{busy === 'optimize' ? 'Optimizing…' : 'Optimize Now'}</button></div></header>
         {error && <p role="alert" className="mb-5 border border-red-400/40 bg-red-500/10 px-4 py-3 text-sm text-red-200">{error}</p>}

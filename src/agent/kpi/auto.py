@@ -31,6 +31,7 @@ def generate_kpis(
         for number, definition in enumerate(definitions, start=1):
             snapshot = KPIAggregateExecutor(connection_provider).execute(definition)
             repository.save_snapshot(snapshot)
+            repository.set_generation_status(monitored_database_id, "running", analysis_run_id, number)
             if progress:
                 progress("kpis", f"Calculated KPI {number}/{len(definitions)}: {definition.title}.")
         repository.set_generation_status(monitored_database_id, "succeeded", analysis_run_id, len(definitions))

@@ -8,10 +8,11 @@ from collections import defaultdict
 from typing import Any, Literal
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request, Response, status
-from fastapi.responses import StreamingResponse
+from fastapi.encoders import jsonable_encoder
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
-from src.agent.kpi import KPIAggregateExecutor, KPIDiscoveryAgent, KPIDiscoveryUnavailable, KPIRepository, generate_kpis
+from src.agent.kpi import KPIAggregateExecutor, KPICandidate, KPIDiscoveryAgent, KPIDiscoveryUnavailable, KPIRepository, generate_kpis
 
 from .analysis_repository import ensure_owned_database
 from .auth import current_user
@@ -47,6 +48,27 @@ def _ensure_owned(connection_id: str, user: dict[str, object]) -> None:
     ensure_owned_database(connection_id, _owner_subject(user))
 
 
+def _validate_candidate(repository: KPIRepository, connection_id: str, candidate: KPICandidate) -> tuple[str, KPICandidate]:
+    context = repository.current_schema_context(connection_id)
+    if context is None:
+        raise HTTPException(status_code=409, detail="Run schema analysis before managing KPIs")
+    revision_id, schema, _ = context
+    if not any(table.schema_name == candidate.schema_name and table.table_name == candidate.table_name for table in schema.tables):
+        raise HTTPException(status_code=422, detail="KPI table is not in the current schema")
+    columns = {column.column_name for column in schema.columns if column.table_name == candidate.table_name}
+    for column in (candidate.measure_column, candidate.time_column, candidate.dimension_column):
+        if column and column not in columns:
+            raise HTTPException(status_code=422, detail=f"KPI column is not in table: {column}")
+    return revision_id, candidate
+
+
+def _generate_and_invalidate(connection_id: str, provider: Any) -> None:
+    try:
+        generate_kpis(connection_id, provider)
+    finally:
+        invalidate(connection_id, "kpis/dashboard")
+
+
 @router.post("/generate", status_code=status.HTTP_202_ACCEPTED)
 def generate_dashboard_kpis(
     connection_id: str,
@@ -67,8 +89,20 @@ def generate_dashboard_kpis(
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)) from exc
     repository.set_generation_status(connection_id, "running")
     invalidate(connection_id, "kpis/dashboard")
-    background_tasks.add_task(generate_kpis, connection_id, connection_provider(connection_id, owner))
+    background_tasks.add_task(_generate_and_invalidate, connection_id, connection_provider(connection_id, owner))
     return {"status": "queued"}
+
+
+@router.get("/generation")
+def generation_status(
+    connection_id: str,
+    user: dict[str, object] = Depends(current_user),
+    repository: KPIRepository = Depends(get_kpi_repository),
+) -> dict[str, object]:
+    _ensure_owned(connection_id, user)
+    return repository.generation_status(connection_id) or {
+        "status": "idle", "generated_count": 0, "error_message": None, "updated_at": None,
+    }
 
 
 def discover_candidates(
@@ -212,6 +246,69 @@ def list_definitions(
     return {"data": [definition.model_dump() for definition in repository.list_definitions(connection_id)]}
 
 
+@router.post("/definitions")
+def create_definition(
+    connection_id: str,
+    candidate: KPICandidate,
+    user: dict[str, object] = Depends(current_user),
+    repository: KPIRepository = Depends(get_kpi_repository),
+) -> dict[str, object]:
+    _ensure_owned(connection_id, user)
+    revision_id, candidate = _validate_candidate(repository, connection_id, candidate)
+    definition = repository.create_definition(connection_id, revision_id, candidate)
+    invalidate(connection_id, "kpis/dashboard")
+    return definition.model_dump()
+
+
+@router.put("/definitions/{definition_id}")
+def update_definition(
+    connection_id: str,
+    definition_id: str,
+    candidate: KPICandidate,
+    user: dict[str, object] = Depends(current_user),
+    repository: KPIRepository = Depends(get_kpi_repository),
+) -> dict[str, object]:
+    _ensure_owned(connection_id, user)
+    revision_id, candidate = _validate_candidate(repository, connection_id, candidate)
+    definition = repository.update_definition(definition_id, connection_id, revision_id, candidate)
+    if definition is None:
+        raise HTTPException(status_code=404, detail="KPI definition not found")
+    invalidate(connection_id, "kpis/dashboard", f"kpis/chart:{definition_id}")
+    return definition.model_dump()
+
+
+@router.delete("/definitions/{definition_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_definition(
+    connection_id: str,
+    definition_id: str,
+    user: dict[str, object] = Depends(current_user),
+    repository: KPIRepository = Depends(get_kpi_repository),
+) -> None:
+    _ensure_owned(connection_id, user)
+    if not repository.delete_definition(definition_id, connection_id):
+        raise HTTPException(status_code=404, detail="KPI definition not found")
+    invalidate(connection_id, "kpis/dashboard", f"kpis/chart:{definition_id}")
+
+
+@router.get("/definitions/{definition_id}")
+def definition_detail(
+    connection_id: str,
+    definition_id: str,
+    user: dict[str, object] = Depends(current_user),
+    repository: KPIRepository = Depends(get_kpi_repository),
+) -> dict[str, object]:
+    _ensure_owned(connection_id, user)
+    definition = repository.get_definition(definition_id, connection_id)
+    if definition is None:
+        raise HTTPException(status_code=404, detail="KPI definition not found")
+    snapshot = repository.latest_snapshot(definition_id, connection_id)
+    return {
+        "definition": definition.model_dump(),
+        "snapshot": snapshot,
+        "chart": _chart(definition, snapshot) if snapshot else None,
+    }
+
+
 @router.get("/dashboard")
 def kpi_dashboard(
     connection_id: str,
@@ -224,8 +321,8 @@ def kpi_dashboard(
     data = []
     for definition in repository.list_definitions(connection_id):
         snapshot = snapshots.get(definition.id)
-        data.append({**definition.model_dump(), "chart": _chart(definition, snapshot) if snapshot else None})
-    return cached_json(request, connection_id, "kpis/dashboard", {"data": data, "generation": repository.generation_status(connection_id)})
+        data.append({**definition.model_dump(), "chart": _chart(definition, snapshot) if snapshot else None, "snapshot": snapshot})
+    return JSONResponse(jsonable_encoder({"data": data, "generation": repository.generation_status(connection_id)}))
 
 
 @router.post("/definitions/{definition_id}/refresh")

@@ -5,7 +5,6 @@ export type DashboardSection = 'overview' | 'statistics' | 'health-checks' | 'sc
 export type JsonRecord = Record<string, unknown>;
 
 const pathFor = (section: DashboardSection) => section === 'optimizer' ? 'optimizer/slow-queries' : section === 'kpis' ? 'kpis/dashboard' : section;
-const ttlFor = (section: DashboardSection) => section === 'schema' ? 3_600_000 : 30_000;
 const asRecord = (value: unknown): JsonRecord => value && typeof value === 'object' && !Array.isArray(value) ? value as JsonRecord : {};
 const asRows = (value: unknown): JsonRecord[] => Array.isArray(value) ? value as JsonRecord[] : [];
 
@@ -42,9 +41,9 @@ export function resourcesFromReport(report: JsonRecord): Partial<Record<Dashboar
   return result;
 }
 
-export async function fetchDashboardResource(connectionId: string, section: DashboardSection, signal?: AbortSignal): Promise<{ payload: JsonRecord; cached: boolean; collecting: boolean }> {
+export async function fetchDashboardResource(connectionId: string, section: DashboardSection, signal?: AbortSignal, force = false): Promise<{ payload: JsonRecord; cached: boolean; collecting: boolean }> {
   const resource = pathFor(section), key = dashboardCacheKey(connectionId, resource), cached = readDashboardCache(key);
-  if (cached && Date.now() - cached.fetchedAt < ttlFor(section)) return { payload: cached.payload, cached: true, collecting: false };
+  if (cached && !force) return { payload: cached.payload, cached: true, collecting: false };
   const response = await authFetch(`/connections/${connectionId}/${resource}`, { signal, headers: cached?.etag ? { 'If-None-Match': cached.etag } : {} });
   if (response.status === 304 && cached) return { payload: cached.payload, cached: true, collecting: false };
   const payload = await response.json().catch(() => ({})) as JsonRecord;

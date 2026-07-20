@@ -38,7 +38,7 @@ export default function AuthPage({ signup }: { signup: boolean }) {
       await authenticate(signup ? '/auth/signup' : '/auth/login', signup
         ? { name: String(values.get('name')), email: String(values.get('email')), password }
         : { email: String(values.get('email')), password });
-      navigate('/');
+      navigate('/dashboard', { replace: true });
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : 'Authentication failed. Please try again.');
     } finally {

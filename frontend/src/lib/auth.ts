@@ -1,4 +1,6 @@
-const apiUrl = import.meta.env.VITE_API_URL || 'http://localhost:8000';
+import { cachedResource, clearResourceCache } from './resourceCache';
+
+const apiUrl = import.meta.env.VITE_API_URL || 'https://packets-declaration-terry-reid.trycloudflare.com';
 const sessionKey = 'dbvoyager-session';
 
 type AuthResponse = {
@@ -53,11 +55,22 @@ export async function authFetch(path: string, init: RequestInit = {}): Promise<R
   return response;
 }
 
+export async function authJson<T>(path: string, init: RequestInit = {}, force = false): Promise<T> {
+  const request = async () => {
+    const response = await authFetch(path, init);
+    const body = await response.json().catch(() => ({})) as T & { detail?: string; collection_status?: string; status?: string };
+    if (!response.ok) throw new Error(String(body.detail || 'Request failed'));
+    return { body, cacheable: response.status !== 202 && body.collection_status !== 'collecting' && body.status !== 'collecting' };
+  };
+  if ((init.method || 'GET').toUpperCase() !== 'GET') return (await request()).body;
+  return cachedResource(path, request, value => value.cacheable, force).then(value => value.body);
+}
+
 export async function logout(): Promise<void> {
   await fetch(`${apiUrl}/auth/logout`, { method: 'POST', credentials: 'include' });
   clearSession();
 }
 
-export const clearSession = () => { sessionStorage.removeItem(sessionKey); clearDashboardCache(); };
+export const clearSession = () => { sessionStorage.removeItem(sessionKey); clearDashboardCache(); clearResourceCache(); };
 export const isAuthenticated = () => Boolean(sessionStorage.getItem(sessionKey));
 import { clearDashboardCache } from './dashboardCache';

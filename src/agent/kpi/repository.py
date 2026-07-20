@@ -274,14 +274,58 @@ class KPIRepository:
         definitions = self.list_definitions(monitored_database_id)
         return next((definition for definition in definitions if definition.id == definition_id), None)
 
+    def create_definition(
+        self, monitored_database_id: str, schema_revision_id: str, candidate: KPICandidate
+    ) -> KPIDefinition:
+        with self._connection_factory() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """INSERT INTO kpi_definitions (candidate_id, monitored_database_id, schema_revision_id, definition_json)
+                       VALUES (NULL, %s, %s, %s) RETURNING id""",
+                    (monitored_database_id, schema_revision_id, json.dumps(candidate.model_dump())),
+                )
+                definition_id = str(cursor.fetchone()[0])
+        return KPIDefinition(
+            id=definition_id, monitored_database_id=monitored_database_id,
+            schema_revision_id=schema_revision_id, **candidate.model_dump(),
+        )
+
+    def update_definition(
+        self, definition_id: str, monitored_database_id: str, schema_revision_id: str, candidate: KPICandidate
+    ) -> KPIDefinition | None:
+        with self._connection_factory() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """UPDATE kpi_definitions SET definition_json = %s, schema_revision_id = %s
+                       WHERE id = %s AND monitored_database_id = %s AND active
+                       RETURNING schema_revision_id""",
+                    (json.dumps(candidate.model_dump()), schema_revision_id, definition_id, monitored_database_id),
+                )
+                row = cursor.fetchone()
+        return None if row is None else KPIDefinition(
+            id=definition_id, monitored_database_id=monitored_database_id,
+            schema_revision_id=str(row[0]), **candidate.model_dump(),
+        )
+
+    def delete_definition(self, definition_id: str, monitored_database_id: str) -> bool:
+        with self._connection_factory() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """UPDATE kpi_definitions SET active = false
+                       WHERE id = %s AND monitored_database_id = %s AND active""",
+                    (definition_id, monitored_database_id),
+                )
+                return cursor.rowcount == 1
+
     @staticmethod
     def _snapshot_payload(row: tuple[Any, ...]) -> dict[str, Any]:
         return {
             "analysis_run_id": str(row[0]) if row[0] is not None else None,
-            "points": row[1] if isinstance(row[1], list) else json.loads(row[1]),
-            "row_count": row[2],
-            "execution_ms": row[3],
-            "generated_at": row[4],
+            "sql": row[1],
+            "points": row[2] if isinstance(row[2], list) else json.loads(row[2]),
+            "row_count": row[3],
+            "execution_ms": row[4],
+            "generated_at": row[5],
         }
 
     def latest_snapshot(
@@ -297,7 +341,7 @@ class KPIRepository:
             with connection.cursor() as cursor:
                 cursor.execute(
                     """
-                    SELECT analysis_run_id, points_json, row_count, execution_ms, created_at
+                    SELECT analysis_run_id, sql_text, points_json, row_count, execution_ms, created_at
                     FROM kpi_snapshots
                     WHERE kpi_definition_id = %s AND status = 'succeeded'"""
                     + database_scope
@@ -316,7 +360,7 @@ class KPIRepository:
                 cursor.execute(
                     """
                     SELECT DISTINCT ON (kpi_definition_id)
-                        kpi_definition_id, analysis_run_id, points_json, row_count, execution_ms, created_at
+                        kpi_definition_id, analysis_run_id, sql_text, points_json, row_count, execution_ms, created_at
                     FROM kpi_snapshots
                     WHERE monitored_database_id = %s AND status = 'succeeded'
                     ORDER BY kpi_definition_id, created_at DESC

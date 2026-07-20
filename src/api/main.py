@@ -56,11 +56,13 @@ app = FastAPI(
 )
 
 origins = [origin.strip() for origin in os.getenv("FRONTEND_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173").split(",") if origin.strip()]
+local_origin_pattern = r".*"
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
+    allow_origin_regex=os.getenv("FRONTEND_ORIGIN_REGEX", local_origin_pattern),
     allow_credentials=True,
-    allow_methods=["GET", "POST", "PATCH", "DELETE"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
     allow_headers=["Authorization", "Content-Type"],
     expose_headers=["set-auth-jwt"],
 )

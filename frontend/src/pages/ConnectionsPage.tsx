@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState, type FormEvent } from 'react';
 import { Link } from 'react-router-dom';
-import { authFetch } from '../lib/auth';
+import { authJson } from '../lib/auth';
+import { invalidateResource } from '../lib/resourceCache';
 
 type Connection = {
   connection_id: string;
@@ -17,18 +18,7 @@ type Connection = {
 };
 
 type User = { email?: string | null };
-type ApiError = Error & { status?: number };
-
-async function api<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await authFetch(path, init);
-  const body = await response.json().catch(() => ({}));
-  if (!response.ok) {
-    const error = new Error(String((body as { detail?: string }).detail || 'Request failed')) as ApiError;
-    error.status = response.status;
-    throw error;
-  }
-  return body as T;
-}
+async function api<T>(path: string, init?: RequestInit, force = false): Promise<T> { return authJson<T>(path, init, force); }
 
 function icon(name: string, className = '') {
   return <span aria-hidden="true" className={`material-symbols-outlined ${className}`}>{name}</span>;
@@ -64,11 +54,11 @@ export default function ConnectionsPage() {
   const [createOpen, setCreateOpen] = useState(false);
   const [renameTarget, setRenameTarget] = useState<Connection | null>(null);
 
-  const loadConnections = async () => {
+  const loadConnections = async (force = false) => {
     setLoading(true);
     setError('');
     try {
-      const result = await api<{ data: Connection[] }>('/connections');
+      const result = await api<{ data: Connection[] }>('/connections', undefined, force);
       setConnections(result.data);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : 'Could not load connections.');
@@ -96,7 +86,8 @@ export default function ConnectionsPage() {
     setError('');
     try {
       await api(path, { method });
-      await loadConnections();
+      invalidateResource(`/connections/${connection.connection_id}`);
+      await loadConnections(true);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : 'Connection action failed.');
     } finally {
@@ -104,14 +95,12 @@ export default function ConnectionsPage() {
     }
   }
 
-  return <div className="min-h-screen bg-[#0f1418] text-[#dee3e9] md:grid md:grid-cols-[240px_1fr]">
-    <FleetSidebar onAdd={() => setCreateOpen(true)} />
-    <main className="min-w-0">
+  return <div className="min-h-screen bg-[#0f1418] text-[#dee3e9]">
       <FleetHeader email={email} query={query} onQuery={setQuery} />
       <section className="mx-auto max-w-[1600px] p-4 md:p-8">
         <header className="mb-8 flex flex-col justify-between gap-5 sm:flex-row sm:items-end">
           <div><h1 className="font-display text-4xl font-semibold tracking-tight">Connections</h1><p className="mt-1 text-sm text-[#bec8d2]">Fleet Management <span className="mx-2">/</span> <strong className="font-medium text-[#dee3e9]">Database Nodes</strong></p></div>
-          <div className="flex gap-3"><button type="button" onClick={() => void loadConnections()} disabled={loading} className="fleet-button border border-[#88929b] bg-transparent text-[#dee3e9]">{icon('refresh', 'text-lg')} Refresh</button><button type="button" onClick={() => setCreateOpen(true)} className="fleet-button border border-[#89ceff] bg-[#89ceff] font-semibold text-[#00344d]">{icon('add_link', 'text-lg')} Add Connection</button></div>
+          <div className="flex gap-3"><button type="button" onClick={() => void loadConnections(true)} disabled={loading} className="fleet-button border border-[#88929b] bg-transparent text-[#dee3e9]">{icon('refresh', 'text-lg')} Refresh</button><button type="button" onClick={() => setCreateOpen(true)} className="fleet-button border border-[#89ceff] bg-[#89ceff] font-semibold text-[#00344d]">{icon('add_link', 'text-lg')} Add Connection</button></div>
         </header>
         {error && <p role="alert" className="mb-5 border border-red-400/40 bg-red-500/10 px-4 py-3 text-sm text-red-200">{error}</p>}
         {loading ? <div className="grid min-h-72 place-items-center border border-[#3e4850] text-sm text-[#bec8d2]">Loading fleet…</div> : <div className="grid grid-cols-1 gap-5 md:grid-cols-2 xl:grid-cols-3">
@@ -121,15 +110,9 @@ export default function ConnectionsPage() {
         {!loading && !visible.length && query && <p className="mt-5 text-sm text-[#bec8d2]">No systems match “{query}”.</p>}
         <footer className="mt-10 flex flex-col justify-between gap-4 border-t border-[#3e4850]/60 py-5 font-mono text-[11px] uppercase tracking-wider text-[#bec8d2] lg:flex-row lg:items-center"><div className="flex flex-wrap gap-x-7 gap-y-2"><span>Active clusters: <b className="ml-1 text-lg text-[#89ceff]">{String(active).padStart(2, '0')}</b></span><span>Cache hit: <b className="ml-1 text-lg text-emerald-300">{formatNumber(averageCacheHit, '%')}</b></span><span>Last collection: <b className="ml-1 text-lg text-[#dee3e9]">{relativeTime(latest)}</b></span></div><span>DBVoyager // Fleet Control</span></footer>
       </section>
-    </main>
-    {createOpen && <CreateConnection onClose={() => setCreateOpen(false)} onCreated={() => { setCreateOpen(false); void loadConnections(); }} />}
-    {renameTarget && <RenameConnection connection={renameTarget} onClose={() => setRenameTarget(null)} onSaved={() => { setRenameTarget(null); void loadConnections(); }} />}
+    {createOpen && <CreateConnection onClose={() => setCreateOpen(false)} onCreated={() => { invalidateResource('/connections'); setCreateOpen(false); void loadConnections(true); }} />}
+    {renameTarget && <RenameConnection connection={renameTarget} onClose={() => setRenameTarget(null)} onSaved={() => { invalidateResource('/connections'); setRenameTarget(null); void loadConnections(true); }} />}
   </div>;
-}
-
-function FleetSidebar({ onAdd }: { onAdd: () => void }) {
-  const nav = [['dashboard', 'Overview', '/dashboard'], ['dns', 'Connections', '/connections'], ['chat_bubble', 'BI Navigator', '/bi-chat'], ['table_chart', 'Schema Explorer', '/schema-explorer'], ['auto_fix_high', 'Optimizer', '/optimizer'], ['auto_graph', 'Health Checks', '/health-checks'], ['terminal', 'SQL Editor', '/dashboard?section=slow-queries'], ['query_stats', 'Metrics', '/dashboard?section=statistics'], ['settings', 'Settings', '/dashboard?section=settings']];
-  return <aside className="hidden min-h-screen border-r border-[#3e4850] bg-[#0f1418] py-4 md:flex md:flex-col"><div className="mb-10 px-7"><h2 className="font-display text-xl font-bold text-[#89ceff]">DBVoyager</h2><p className="mt-1 font-mono text-[10px] tracking-[.17em] text-[#bec8d2]">MISSION CONTROL</p></div><nav className="space-y-1">{nav.map(([name, label, href]) => <Link key={label} to={href} className={`flex items-center gap-3 border-l-2 px-6 py-3 text-sm transition ${label === 'Connections' ? 'border-[#89ceff] bg-[#30353a]/50 text-[#89ceff]' : 'border-transparent text-[#bec8d2] hover:bg-[#252b2f] hover:text-[#dee3e9]'}`}>{icon(name)} {label}</Link>)}</nav><div className="mt-auto border-t border-[#3e4850]/60 px-5 pt-4"><button type="button" onClick={onAdd} className="fleet-button w-full bg-[#89ceff] font-semibold text-[#00344d]">{icon('add')} New Instance</button><a className="mt-5 flex items-center gap-3 text-sm text-[#bec8d2] hover:text-[#dee3e9]" href="/docs">{icon('description', 'text-lg')} Docs</a><span className="mt-3 flex items-center gap-3 text-sm text-[#bec8d2]">{icon('help_outline', 'text-lg')} Support</span></div></aside>;
 }
 
 function FleetHeader({ email, query, onQuery }: { email: string; query: string; onQuery: (value: string) => void }) {

@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import officialLogo from '../../../../sample/stitch/stitch_dbvoyager_platform_ui/dbvoyager_logo_icon/screen.png';
 import { isAuthenticated, logout } from '../lib/auth';
 
-const apiUrl = import.meta.env.VITE_API_URL || 'http://localhost:8000';
+const apiUrl = import.meta.env.VITE_API_URL || 'https://packets-declaration-terry-reid.trycloudflare.com';
 const demoUrl = import.meta.env.VITE_DEMO_URL || 'https://www.youtube.com/results?search_query=DBVoyager+demo';
 const pages = [
   ['Autonomous DBA', '/autonomous-dba', 'Always-on database intelligence that surfaces what needs attention first.'],
