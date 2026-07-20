@@ -15,6 +15,8 @@ from src.services.health.health_summary import (
 )
 
 from src.agent.health.executive_summary_agent import ExecutiveSummaryAgent
+from pydantic import BaseModel
+from src.services.health.fix_service import HealthFixEngine
 
 from .analysis_repository import (
     _record_progress,
@@ -115,6 +117,50 @@ def refresh_dashboard(
 def refresh_brief(connection_id: str, background_tasks: BackgroundTasks, user: dict[str, object] = Depends(current_user)) -> dict[str, str]:
     return _start_collection_run(connection_id, "brief", background_tasks, user)
 
+
+class ProposeFixRequest(BaseModel):
+    finding: dict[str, Any]
+
+
+class ExecuteFixRequest(BaseModel):
+    sql_query: str
+
+
+@router.post("/health-checks/propose-fix")
+def propose_fix(
+    connection_id: str,
+    payload: ProposeFixRequest,
+    user: dict[str, object] = Depends(current_user),
+) -> dict[str, Any]:
+    """Step 1: AI generates the SQL query to show the user for approval."""
+    owner = _owner_subject(user)
+    ensure_owned_database(connection_id, owner)
+
+    engine = HealthFixEngine()
+    return engine.generate_proposed_fix(payload.finding)
+
+
+@router.post("/health-checks/apply-fix")
+def apply_fix_and_refresh(
+    connection_id: str,
+    payload: ExecuteFixRequest,
+    user: dict[str, object] = Depends(current_user),
+) -> dict[str, Any]:
+    """Step 2: Executed upon user confirmation -> Applies SQL fix & invalidates cache."""
+    owner = _owner_subject(user)
+    ensure_owned_database(connection_id, owner)
+
+    # Execute SQL on database
+    provider = connection_provider(connection_id, owner)
+    HealthFixEngine.apply_fix_and_commit(provider, payload.sql_query)
+
+    # Invalidate cached endpoints so UI updates cleanly
+    invalidate(connection_id, "health-checks", "overview", "insights:10")
+
+    return {
+        "status": "success",
+        "message": "Fix successfully applied.",
+    }
 
 @router.post("/statistics/refresh", status_code=status.HTTP_202_ACCEPTED)
 def refresh_statistics(
