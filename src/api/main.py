@@ -8,7 +8,8 @@ from fastapi import FastAPI  # type: ignore
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 
-from src.agent.manager_agent_standalone import ManagerAgent
+# 1. ADD: Import HealthFixEngine and health router
+from src.services.health.fix_service import HealthFixEngine
 from .auth import router as auth_router
 from .business_api import router as business_router
 from .connections import router as connections_router
@@ -18,6 +19,9 @@ from .management import router as management_router
 from .manager_agent_router import router as manager_agent_router
 from .optimizer import router as optimizer_router
 from .query_generator import router as query_generator_router
+# ADD: Import health router (assuming health_router.py is in the same directory)
+from .health_router import router as health_router
+
 from .analysis_repository import claim_due_collection_runs, run_scheduled_collection
 from .persistence_worker import process_persistence_jobs
 
@@ -46,21 +50,22 @@ async def lifespan(_app: FastAPI):
                 pass
             await asyncio.sleep(0.1)
 
-    # --- Automated Periodic Manager Agent Background Worker ---
-    async def manager_agent_worker() -> None:
+    # 2. UPDATE: Switch to HealthFixEngine for automated health & fix loop
+    async def health_fix_engine_worker() -> None:
         # Check every hour (3600 seconds)
         CHECK_INTERVAL_SECONDS = 3600
-        manager_agent = ManagerAgent()
+        engine = HealthFixEngine()
         while True:
             try:
-                await asyncio.to_thread(manager_agent.run_periodic_check)
+                # Executes inspection, scoring, AI fix proposals, and manager alerts
+                await asyncio.to_thread(engine.run_automated_health_scan)
             except Exception:
                 pass
             await asyncio.sleep(CHECK_INTERVAL_SECONDS)
 
     task = asyncio.create_task(scheduled_worker())
     persistence_task = asyncio.create_task(persistence_worker())
-    manager_task = asyncio.create_task(manager_agent_worker())
+    manager_task = asyncio.create_task(health_fix_engine_worker())
 
     try:
         yield
@@ -117,3 +122,5 @@ app.include_router(business_router)
 app.include_router(management_router)
 app.include_router(manager_agent_router)
 app.include_router(query_generator_router)
+# 3. ADD: Register the Health & Fix Engine router
+app.include_router(health_router)

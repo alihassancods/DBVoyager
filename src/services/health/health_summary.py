@@ -29,6 +29,18 @@ class HealthSummaryService:
         return max(score, 0)
 
     @staticmethod
+    def get_status_label(score: int) -> str:
+        """Translates a numeric score into a non-technical manager status label."""
+        if score >= 90:
+            return "EXCELLENT"
+        elif score >= 75:
+            return "STABLE"
+        elif score >= 50:
+            return "WARNING"
+        else:
+            return "CRITICAL"
+
+    @staticmethod
     def top_findings(
         findings: list[dict[str, Any]],
         limit: int = 5,
