@@ -7,15 +7,15 @@
 
   <p>
     <a href="#features"><img src="https://img.shields.io/badge/AI_Agents-7_teams-3b82f6?style=flat-square" alt="AI Agents"></a>
-    <a href="#tech-stack"><img src="https://img.shields.io/badge/DeepSeek-LLM-4F46E5?style=flat-square" alt="GPT-5.6 LLM"></a>
     <a href="#tech-stack"><img src="https://img.shields.io/badge/Python-3.14+-3776AB?style=flat-square&logo=python&logoColor=white" alt="Python 3.14+"></a>
     <a href="#tech-stack"><img src="https://img.shields.io/badge/FastAPI-0.139-009688?style=flat-square&logo=fastapi&logoColor=white" alt="FastAPI"></a>
     <a href="#tech-stack"><img src="https://img.shields.io/badge/React-18-61DAFB?style=flat-square&logo=react&logoColor=white" alt="React 18"></a>
     <a href="#tech-stack"><img src="https://img.shields.io/badge/PostgreSQL-16-4169E1?style=flat-square&logo=postgresql&logoColor=white" alt="PostgreSQL"></a>
-    <a href="#tech-stack"><img src="https://img.shields.io/badge/DeepSeek-LLM-4F46E5?style=flat-square" alt="GPT-5.6 LLM"></a>
+    <a href="#tech-stack"><img src="https://img.shields.io/badge/DeepSeek-LLM-4F46E5?style=flat-square" alt="DeepSeek LLM"></a>
     <br>
     <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" alt="MIT License"></a>
     <a href="https://www.youtube.com/results?search_query=DBVoyager+demo"><img src="https://img.shields.io/badge/demo-video-ff0000?style=flat-square&logo=youtube&logoColor=white" alt="Demo"></a>
+    <a href="#built-with"><img src="https://img.shields.io/badge/built_with-Codex-000000?style=for-the-badge&logo=openai&logoColor=white" alt="Built with Codex"></a>
   </p>
 </div>
 
@@ -437,6 +437,32 @@ The proactive fixer. Runs automated health scans every hour, generates candidate
 - [ ] **Team collaboration** — Shared dashboards, comment threads on findings
 - [ ] **On-premise deployment** — Fully air-gapped installation option
 - [ ] **Cost optimization** — Right-sizing recommendations based on usage patterns
+
+---
+
+## Built With  <a id="built-with"></a>
+
+DBVoyager was built start-to-finish with **Anthropic's Claude Code (Codex)** — the AI pair programmer that handled architecture, implementation, testing, and deployment across the entire stack. Every component was iterated through natural-language conversations: describe what needed to happen, review the generated code, refine.
+
+Here's how Codex shaped the project across its evolution:
+
+### Phase 1 — Foundation (Auth + Core API)
+Neon Auth integration, encrypted credential storage (AES-256-GCM), JWT ownership checks, persistent analysis runs and snapshots, dashboard persistence, polling API, and the `v2.py` frontend workflow client. The initial 32 tests passed on day one.
+
+### Phase 2 — Database Inspector Pipeline
+Complete inspector output surfaced through the frontend: all database, query, table, index, and lock statistics plus full schema metadata — tables, columns, keys, indexes, and relations. The health check engine (`tools/health.py`) was refactored to reuse `StatisticsInspector` data, keeping direct SQL only for health-specific checks.
+
+### Phase 3 — Frontend Build-Out
+A full React SPA (Vite + TypeScript + Tailwind) with crash protection (`ErrorBoundary`), sessionStorage-based caching, SSE streaming for live dashboard and BI updates, route-level loading UI, and a production build pipeline deployable on Vercel with configurable `VITE_API_URL`.
+
+### Phase 4 — Real-Time Dashboard
+Redis-backed SSE previews that render collected data immediately while persistence and enrichment continue in the background. Added caching, stale-request cancellation, smoother panel transitions, and a durable collection progress indicator.
+
+### Phase 5 — Durability & Scheduling
+Persisted KPI snapshots by database, scheduled brief (15 min) and deep (24 h) analysis runs with lease-based worker coordination, 30-day retention with daily rollups, dashboard reads from stored snapshots, and a configurable periodic BI-agent interval.
+
+### Phase 6 — Optimization & Stability
+Frontend crash protection, Redis lazy cache integration, route-loading UI polish, Schema Explorer stability (table clicks no longer trigger full-page reloads), deployment docs, Vercel environment and routing configuration, and the configurable `DBVOYAGER_AGENT_INTERVAL_SECONDS` env var.
 
 ---
 
