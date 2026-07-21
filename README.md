@@ -442,7 +442,7 @@ The proactive fixer. Runs automated health scans every hour, generates candidate
 
 ## Built With  <a id="built-with"></a>
 
-DBVoyager was built start-to-finish with **Anthropic's Claude Code (Codex)** — the AI pair programmer that handled architecture, implementation, testing, and deployment across the entire stack. Every component was iterated through natural-language conversations: describe what needed to happen, review the generated code, refine.
+This project was build by using the codex and the gpt 5.6. The inital framework was setup using the codex while the plan and the improvements ideas are made using the GPT. The whole code is efficiently written by the careful usage of both codex and the GPT.
 
 Here's how Codex shaped the project across its evolution:
 
