@@ -6,6 +6,8 @@
   **An autonomous AI platform that monitors, optimizes, and protects your PostgreSQL databases — so you don't have to.**
 
   <p>
+    <a href="https://db-voyager.vercel.app/"><img src="https://img.shields.io/badge/🚀_Live_App-db--voyager.vercel.app-0A192F?style=for-the-badge&logo=vercel&logoColor=white" alt="Live App"></a>
+    <br><br>
     <a href="#features"><img src="https://img.shields.io/badge/AI_Agents-7_teams-3b82f6?style=flat-square" alt="AI Agents"></a>
     <a href="#tech-stack"><img src="https://img.shields.io/badge/Python-3.14+-3776AB?style=flat-square&logo=python&logoColor=white" alt="Python 3.14+"></a>
     <a href="#tech-stack"><img src="https://img.shields.io/badge/FastAPI-0.139-009688?style=flat-square&logo=fastapi&logoColor=white" alt="FastAPI"></a>
@@ -18,6 +20,8 @@
     <a href="#built-with"><img src="https://img.shields.io/badge/built_with-Codex-000000?style=for-the-badge&logo=openai&logoColor=white" alt="Built with Codex"></a>
   </p>
 </div>
+
+> 🌐 **Live Web Application:** [https://db-voyager.vercel.app/](https://db-voyager.vercel.app/)
 
 ---
 
@@ -37,14 +41,21 @@ It watches your database 24/7, investigates what changed, and prepares safe, act
 
 ---
 
+## 🔗 Quick Links
+
+* 🌐 **Live Web Application:** [https://db-voyager.vercel.app/](https://db-voyager.vercel.app/)
+* 🎬 **Video Demo:** [Watch on YouTube](https://www.youtube.com/results?search_query=DBVoyager+demo)
+
+---
+
 ## Demo
 
 <p align="center">
-  <a href="https://www.youtube.com/results?search_query=DBVoyager+demo">
+  <a href="https://db-voyager.vercel.app/">
     <img src="./frontend/public/screen.png" alt="Watch the demo" width="640">
   </a>
   <br>
-  <em>▶️ <a href="https://www.youtube.com/results?search_query=DBVoyager+demo">Watch the full demo on YouTube</a></em>
+  <em>🌐 <a href="https://db-voyager.vercel.app/">Try DBVoyager Live in Your Browser</a> | ▶️ <a href="https://www.youtube.com/results?search_query=DBVoyager+demo">Watch the full video demo on YouTube</a></em>
 </p>
 
 ---
