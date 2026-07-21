@@ -23,8 +23,8 @@ from .dashboard import router as dashboard_router
 from .health_router import router as health_router
 from .kpis import router as kpis_router
 from .management import router as management_router
-from .manager_agent_router import router as manager_agent_router
-from .optimizer import router as optimizer_router
+from .notifications import notification_listener, router as notifications_router
+from .analysis_repository import claim_due_collection_runs, run_scheduled_collection
 from .persistence_worker import process_persistence_jobs
 from .query_generator import router as query_generator_router
 
@@ -83,25 +83,15 @@ async def lifespan(_app: FastAPI):
     # Initialize task references
     task = asyncio.create_task(scheduled_worker())
     persistence_task = asyncio.create_task(persistence_worker())
-    manager_task = asyncio.create_task(health_fix_engine_worker())
-    bi_task = asyncio.create_task(bi_agent_worker())
-
+    notifications_task = asyncio.create_task(notification_listener())
     try:
         yield
     finally:
         # Clean shutdown for all workers
         task.cancel()
         persistence_task.cancel()
-        manager_task.cancel()
-        bi_task.cancel()
-        await asyncio.gather(
-            task,
-            persistence_task,
-            manager_task,
-            bi_task,
-            return_exceptions=True,
-        )
-
+        notifications_task.cancel()
+        await asyncio.gather(task, persistence_task, notifications_task, return_exceptions=True)
 
 app = FastAPI(
     title="DBVoyager API",
@@ -147,6 +137,4 @@ app.include_router(optimizer_router)
 app.include_router(auth_router)
 app.include_router(business_router)
 app.include_router(management_router)
-app.include_router(manager_agent_router)
-app.include_router(query_generator_router)
-app.include_router(health_router)
+app.include_router(notifications_router)

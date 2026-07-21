@@ -125,12 +125,20 @@ def discover_candidates(
     return {"data": [{"id": candidate_id, **candidate.model_dump()} for candidate_id, candidate in saved]}
 
 
+def _to_number(v: object) -> float | int | None:
+    if v is None:
+        return None
+    try:
+        return int(v) if isinstance(v, float | int) or (isinstance(v, str) and "." not in v) else float(v)
+    except (ValueError, TypeError):
+        return None
+
 def _chart(definition: Any, snapshot: dict[str, Any]) -> dict[str, Any]:
     series: dict[str, list[dict[str, object]]] = defaultdict(list)
     for point in snapshot["points"]:
         name = str(point.get("dimension", definition.title))
         x = point.get("period", point.get("dimension", definition.title))
-        series[name].append({"x": str(x), "y": point.get("value")})
+        series[name].append({"x": str(x), "y": _to_number(point.get("value"))})
     return {
         "kpi_id": definition.id,
         "title": definition.title,
@@ -321,7 +329,13 @@ def kpi_dashboard(
     data = []
     for definition in repository.list_definitions(connection_id):
         snapshot = snapshots.get(definition.id)
-        data.append({**definition.model_dump(), "chart": _chart(definition, snapshot) if snapshot else None, "snapshot": snapshot})
+        cleaned = dict(snapshot) if snapshot else None
+        if cleaned and "points" in cleaned:
+            cleaned["points"] = [
+                {k: _to_number(v) if k == "value" else v for k, v in point.items()}
+                for point in cleaned["points"]
+            ]
+        data.append({**definition.model_dump(), "chart": _chart(definition, snapshot) if snapshot else None, "snapshot": cleaned})
     return JSONResponse(jsonable_encoder({"data": data, "generation": repository.generation_status(connection_id)}))
 
 

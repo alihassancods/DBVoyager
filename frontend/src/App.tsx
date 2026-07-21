@@ -12,6 +12,7 @@ import HealthChecksPage from './pages/HealthChecksPage';
 import BiChatPage from './pages/BiChatPage';
 import KpisPage from './pages/KpisPage';
 import AppShell from './AppShell';
+import { ToastProvider } from './components/ui';
 
 function ProtectedRoute({ children }: { children: React.ReactNode }) {
   const [checking, setChecking] = useState(true);
@@ -38,7 +39,7 @@ function PublicOnlyRoute({ children }: { children: React.ReactNode }) {
 import DashboardPage from './pages/DashboardPage';
 
 export default function App() {
-  return <BrowserRouter><Routes>
+  return <ToastProvider><BrowserRouter><Routes>
     <Route path="/" element={<LandingPage />} />
     <Route path="/login" element={<PublicOnlyRoute><AuthPage signup={false} /></PublicOnlyRoute>} />
     <Route path="/signup" element={<PublicOnlyRoute><AuthPage signup /></PublicOnlyRoute>} />
@@ -52,5 +53,5 @@ export default function App() {
     <Route path="/connections/:connectionId/optimizer/queries/:queryId" element={<ProtectedRoute><QueryDetailsPage /></ProtectedRoute>} />
     <Route path="/:slug" element={<ProductPage />} />
     <Route path="*" element={<Navigate to="/" replace />} />
-  </Routes></BrowserRouter>;
+  </Routes></BrowserRouter></ToastProvider>;
 }

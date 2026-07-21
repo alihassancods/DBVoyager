@@ -1,6 +1,6 @@
 import { cachedResource, clearResourceCache } from './resourceCache';
 
-const apiUrl = import.meta.env.VITE_API_URL || 'https://packets-declaration-terry-reid.trycloudflare.com';
+const apiUrl = import.meta.env.VITE_API_URL || 'http://localhost:8000';
 const sessionKey = 'dbvoyager-session';
 
 type AuthResponse = {
@@ -73,4 +73,6 @@ export async function logout(): Promise<void> {
 
 export const clearSession = () => { sessionStorage.removeItem(sessionKey); clearDashboardCache(); clearResourceCache(); };
 export const isAuthenticated = () => Boolean(sessionStorage.getItem(sessionKey));
+export const accessToken = () => sessionStorage.getItem(sessionKey);
+export const apiBaseUrl = () => apiUrl;
 import { clearDashboardCache } from './dashboardCache';

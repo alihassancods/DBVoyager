@@ -2,6 +2,8 @@ import { useEffect, useMemo, useState, type FormEvent } from 'react';
 import { Link } from 'react-router-dom';
 import { authJson } from '../lib/auth';
 import { invalidateResource } from '../lib/resourceCache';
+import { Modal, Skeleton, useToast } from '../components/ui';
+import { useHeaderSearch } from '../AppShell';
 
 type Connection = {
   connection_id: string;
@@ -17,7 +19,6 @@ type Connection = {
   cache_hit_ratio?: number | null;
 };
 
-type User = { email?: string | null };
 async function api<T>(path: string, init?: RequestInit, force = false): Promise<T> { return authJson<T>(path, init, force); }
 
 function icon(name: string, className = '') {
@@ -45,9 +46,9 @@ function statusStyle(connection: Connection) {
 }
 
 export default function ConnectionsPage() {
+  const { showToast } = useToast();
+  const { query } = useHeaderSearch();
   const [connections, setConnections] = useState<Connection[]>([]);
-  const [query, setQuery] = useState('');
-  const [email, setEmail] = useState('');
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState('');
@@ -69,7 +70,6 @@ export default function ConnectionsPage() {
 
   useEffect(() => {
     void loadConnections();
-    void api<User>('/auth/me').then(user => setEmail(user.email || '')).catch(() => undefined);
   }, []);
 
   const visible = useMemo(() => {
@@ -88,36 +88,32 @@ export default function ConnectionsPage() {
       await api(path, { method });
       invalidateResource(`/connections/${connection.connection_id}`);
       await loadConnections(true);
+      showToast({ tone: 'success', message: `${connection.display_name} updated.` });
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : 'Connection action failed.');
+      const message = reason instanceof Error ? reason.message : 'Connection action failed.';
+      setError(message); showToast({ tone: 'error', message });
     } finally {
       setBusy(null);
     }
   }
 
   return <div className="min-h-screen bg-[#0f1418] text-[#dee3e9]">
-      <FleetHeader email={email} query={query} onQuery={setQuery} />
       <section className="mx-auto max-w-[1600px] p-4 md:p-8">
         <header className="mb-8 flex flex-col justify-between gap-5 sm:flex-row sm:items-end">
           <div><h1 className="font-display text-4xl font-semibold tracking-tight">Connections</h1><p className="mt-1 text-sm text-[#bec8d2]">Fleet Management <span className="mx-2">/</span> <strong className="font-medium text-[#dee3e9]">Database Nodes</strong></p></div>
           <div className="flex gap-3"><button type="button" onClick={() => void loadConnections(true)} disabled={loading} className="fleet-button border border-[#88929b] bg-transparent text-[#dee3e9]">{icon('refresh', 'text-lg')} Refresh</button><button type="button" onClick={() => setCreateOpen(true)} className="fleet-button border border-[#89ceff] bg-[#89ceff] font-semibold text-[#00344d]">{icon('add_link', 'text-lg')} Add Connection</button></div>
         </header>
         {error && <p role="alert" className="mb-5 border border-red-400/40 bg-red-500/10 px-4 py-3 text-sm text-red-200">{error}</p>}
-        {loading ? <div className="grid min-h-72 place-items-center border border-[#3e4850] text-sm text-[#bec8d2]">Loading fleet…</div> : <div className="grid grid-cols-1 gap-5 md:grid-cols-2 xl:grid-cols-3">
+        {loading ? <div className="grid grid-cols-1 gap-5 md:grid-cols-2 xl:grid-cols-3">{[0, 1, 2].map(item => <Skeleton key={item} className="min-h-72" />)}</div> : <div className="grid grid-cols-1 gap-5 md:grid-cols-2 xl:grid-cols-3">
           {visible.map(connection => <ConnectionCard key={connection.connection_id} connection={connection} busy={busy} onRename={setRenameTarget} onAction={action} />)}
           <button type="button" onClick={() => setCreateOpen(true)} className="flex min-h-72 flex-col items-center justify-center gap-4 border border-dashed border-[#3e4850] p-5 text-center text-[#bec8d2] transition hover:border-[#89ceff] hover:bg-[#89ceff]/5 hover:text-[#89ceff]"><span className="grid size-14 place-items-center rounded-full border border-dashed border-current">{icon('add', 'text-4xl')}</span><span><strong className="block font-display text-lg">Connect Remote Node</strong><small className="mt-1 block text-sm opacity-70">Provision a new instance in the fleet</small></span></button>
         </div>}
         {!loading && !visible.length && query && <p className="mt-5 text-sm text-[#bec8d2]">No systems match “{query}”.</p>}
         <footer className="mt-10 flex flex-col justify-between gap-4 border-t border-[#3e4850]/60 py-5 font-mono text-[11px] uppercase tracking-wider text-[#bec8d2] lg:flex-row lg:items-center"><div className="flex flex-wrap gap-x-7 gap-y-2"><span>Active clusters: <b className="ml-1 text-lg text-[#89ceff]">{String(active).padStart(2, '0')}</b></span><span>Cache hit: <b className="ml-1 text-lg text-emerald-300">{formatNumber(averageCacheHit, '%')}</b></span><span>Last collection: <b className="ml-1 text-lg text-[#dee3e9]">{relativeTime(latest)}</b></span></div><span>DBVoyager // Fleet Control</span></footer>
       </section>
-    {createOpen && <CreateConnection onClose={() => setCreateOpen(false)} onCreated={() => { invalidateResource('/connections'); setCreateOpen(false); void loadConnections(true); }} />}
-    {renameTarget && <RenameConnection connection={renameTarget} onClose={() => setRenameTarget(null)} onSaved={() => { invalidateResource('/connections'); setRenameTarget(null); void loadConnections(true); }} />}
+    {createOpen && <CreateConnection onClose={() => setCreateOpen(false)} onCreated={() => { invalidateResource('/connections'); setCreateOpen(false); void loadConnections(true); showToast({ tone: 'success', message: 'Connection added.' }); }} />}
+    {renameTarget && <RenameConnection connection={renameTarget} onClose={() => setRenameTarget(null)} onSaved={() => { invalidateResource('/connections'); setRenameTarget(null); void loadConnections(true); showToast({ tone: 'success', message: 'Connection name saved.' }); }} />}
   </div>;
-}
-
-function FleetHeader({ email, query, onQuery }: { email: string; query: string; onQuery: (value: string) => void }) {
-  const initial = email.trim().charAt(0).toUpperCase() || 'D';
-  return <header className="flex min-h-14 items-center justify-between border-b border-[#3e4850] bg-[#1b2024] px-4 md:px-7"><label className="relative hidden w-72 lg:block">{icon('search', 'absolute left-3 top-1/2 -translate-y-1/2 text-[#bec8d2]')}<input value={query} onChange={event => onQuery(event.target.value)} className="w-full rounded-full border-0 bg-[#0f1418] py-2 pl-10 pr-4 text-sm text-[#dee3e9] outline-none ring-[#89ceff] placeholder:text-[#88929b] focus:ring-1" placeholder="Search systems..." /></label><span className="font-mono text-[10px] tracking-[.16em] text-[#bec8d2] lg:hidden">FLEET CONTROL</span><div className="ml-auto flex items-center gap-3"><span className="hidden border border-amber-400 bg-amber-400/10 px-3 py-1 font-mono text-[10px] tracking-[.13em] text-amber-200 sm:block">PRODUCTION ENVIRONMENT</span><Link to="/dashboard" aria-label="Open notifications" className="text-[#bec8d2] hover:text-[#89ceff]">{icon('notifications')}</Link><Link to="/dashboard?section=slow-queries" aria-label="Open SQL observability" className="text-[#bec8d2] hover:text-[#89ceff]">{icon('terminal')}</Link><Link to="/dashboard?section=settings" aria-label="Open settings" className="text-[#bec8d2] hover:text-[#89ceff]">{icon('settings')}</Link><span aria-label={email || 'DBVoyager user'} className="grid size-8 place-items-center rounded-full border border-[#3e4850] bg-[#252b2f] text-xs font-semibold text-[#89ceff]">{initial}</span></div></header>;
 }
 
 function ConnectionCard({ connection, busy, onRename, onAction }: { connection: Connection; busy: string | null; onRename: (connection: Connection) => void; onAction: (connection: Connection, path: string) => Promise<void> }) {
@@ -152,8 +148,4 @@ function RenameConnection({ connection, onClose, onSaved }: { connection: Connec
   const [error, setError] = useState('');
   async function submit(event: FormEvent<HTMLFormElement>) { event.preventDefault(); try { await api(`/connections/${connection.connection_id}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ display_name: displayName }) }); onSaved(); } catch (reason) { setError(reason instanceof Error ? reason.message : 'Could not rename connection.'); } }
   return <Modal title="Connection Settings" onClose={onClose}><form onSubmit={submit} className="space-y-4"><label className="block text-sm">Display name<input required value={displayName} onChange={event => setDisplayName(event.target.value)} className="fleet-input" /></label>{error && <p role="alert" className="text-sm text-red-300">{error}</p>}<button className="fleet-button w-full bg-[#89ceff] font-semibold text-[#00344d]">Save name</button></form></Modal>;
-}
-
-function Modal({ title, onClose, children }: { title: string; onClose: () => void; children: React.ReactNode }) {
-  return <div role="dialog" aria-modal="true" aria-label={title} className="fixed inset-0 z-50 grid place-items-center bg-black/75 p-4 backdrop-blur"><section className="w-full max-w-lg border border-[#89ceff]/30 bg-[#1b2024] p-6 shadow-2xl"><header className="mb-5 flex items-center justify-between"><h2 className="font-display text-2xl font-semibold">{title}</h2><button type="button" onClick={onClose} aria-label="Close dialog" className="text-[#bec8d2] hover:text-[#dee3e9]">{icon('close')}</button></header>{children}</section></div>;
 }

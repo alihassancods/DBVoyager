@@ -1,111 +1,106 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useState } from 'react';
 import { Link, useSearchParams } from 'react-router-dom';
 import { authFetch, authJson } from '../lib/auth';
-import { invalidateDashboardConnection } from '../lib/dashboardCache';
-import { invalidateResource } from '../lib/resourceCache';
-import { DashboardSection, JsonRecord, fetchDashboardResource, overviewFromReport, resourcesFromReport, seedDashboardCache } from '../lib/dashboardData';
+import { fetchDashboardResource, overviewFromReport, type JsonRecord } from '../lib/dashboardData';
+import { useHeaderSearch } from '../AppShell';
 
-type Section = DashboardSection;
-type Connection = { connection_id: string; display_name: string; brief_run_id?: string; deep_analysis_run_id?: string };
-type Row = JsonRecord;
-const navigation: [string, string, Section][] = [
-  ['CORE', '⌂ Overview', 'overview'], ['', '◉ Full statistics', 'statistics'], ['', '▦ Schema explorer', 'schema'], ['', '⌘ SQL observability', 'slow-queries'], ['', '◉ Table statistics', 'statistics/tables'], ['', '◌ Index statistics', 'statistics/indexes'], ['', '◌ Lock statistics', 'statistics/locks'],
-  ['INTELLIGENCE', '✦ Advisors', 'health-checks'], ['', '⌁ Query optimizer', 'optimizer'],
-  ['MANAGEMENT', '◫ ERD diagram', 'schema-diagram'], ['', '⚙ Settings', 'settings'],
-];
+type Connection = { connection_id: string; display_name: string };
+type Overview = JsonRecord & { health_summary?: JsonRecord; database_stats?: JsonRecord; insights?: JsonRecord[]; top_slow_queries?: JsonRecord[] };
 
-const rows = (payload: Row): Row[] => Array.isArray(payload.data) ? payload.data as Row[] : [];
-const record = (payload: unknown): Row => payload && typeof payload === 'object' && !Array.isArray(payload) ? payload as Row : {};
-const value = (row: Row | undefined, key: string, fallback = '—') => row?.[key] === null || row?.[key] === undefined ? fallback : String(row[key]);
-const number = (value: unknown) => Number.isFinite(Number(value)) ? new Intl.NumberFormat('en-US', { maximumFractionDigits: 1 }).format(Number(value)) : '—';
+const number = (value: unknown, suffix = '') => Number.isFinite(Number(value)) ? `${new Intl.NumberFormat('en-US', { maximumFractionDigits: 1 }).format(Number(value))}${suffix}` : '—';
+const icon = (name: string, className = '') => <span aria-hidden="true" className={`material-symbols-outlined ${className}`}>{name}</span>;
+const value = (row: JsonRecord | undefined, key: string) => row?.[key] === null || row?.[key] === undefined ? '—' : String(row[key]);
 
-async function json(path: string, init?: RequestInit): Promise<Row> { return authJson<Row>(path, init); }
-
-async function consumeSse(response: Response, onEvent: (event: string, item: Row) => boolean | Promise<boolean>): Promise<void> {
+async function consumeSse(response: Response, onEvent: (event: string, data: JsonRecord) => Promise<boolean> | boolean) {
   if (!response.body) throw new Error('Streaming is unavailable.');
-  const reader = response.body.getReader(), decoder = new TextDecoder(); let buffer = '';
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
   while (true) {
-    const part = await reader.read(); if (part.done) return;
-    buffer += decoder.decode(part.value, { stream: true }); const messages = buffer.split('\n\n'); buffer = messages.pop() || '';
+    const part = await reader.read();
+    if (part.done) return;
+    buffer += decoder.decode(part.value, { stream: true });
+    const messages = buffer.split('\n\n');
+    buffer = messages.pop() || '';
     for (const message of messages) {
-      const event = message.match(/^event: (.+)$/m)?.[1], raw = message.match(/^data: (.+)$/m)?.[1];
-      if (event && raw && await onEvent(event, JSON.parse(raw) as Row)) { await reader.cancel(); return; }
+      const event = message.match(/^event: (.+)$/m)?.[1];
+      const raw = message.match(/^data: (.+)$/m)?.[1];
+      if (event && raw && await onEvent(event, JSON.parse(raw) as JsonRecord)) { await reader.cancel(); return; }
     }
   }
 }
 
 export default function DashboardPage() {
-  const [searchParams] = useSearchParams();
-  const [connections, setConnections] = useState<Connection[]>([]); const [connectionId, setConnectionId] = useState(''); const [section, setSection] = useState<Section>('overview'); const [displayedSection, setDisplayedSection] = useState<Section>('overview');
-  const [data, setData] = useState<Row>({}); const [progress, setProgress] = useState(''); const [loadingSection, setLoadingSection] = useState<Section | null>(null); const [liveData, setLiveData] = useState(false); const [error, setError] = useState(''); const [modal, setModal] = useState(false); const [cached, setCached] = useState(false);
-  const briefRuns = useRef(new Map<string, string>()); const deepRuns = useRef(new Map<string, string>()); const sectionRef = useRef(section); const resources = useRef(new Map<string, Row>()); const request = useRef(0); const controller = useRef<AbortController | null>(null);
-  useEffect(() => { sectionRef.current = section; }, [section]);
+  const { query } = useHeaderSearch();
+  const [params, setParams] = useSearchParams();
+  const [connections, setConnections] = useState<Connection[]>([]);
+  const [connectionId, setConnectionId] = useState('');
+  const [overview, setOverview] = useState<Overview>({});
+  const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
+  const [progress, setProgress] = useState('');
+  const [error, setError] = useState('');
 
-  const resourceKey = (id: string, next: Section) => `${id}:${next}`;
-  const showResource = (id: string, next: Section, payload: Row, fromCache = false) => { resources.current.set(resourceKey(id, next), payload); setData(payload); setDisplayedSection(next); setCached(fromCache); setLoadingSection(null); };
-  const applyPreview = (id: string, report: Row) => {
-    controller.current?.abort(); ++request.current;
-    invalidateResource(`/connections/${id}/`);
-    const reportResources = resourcesFromReport(report); seedDashboardCache(id, reportResources);
-    for (const [next, payload] of Object.entries(reportResources) as [Section, Row][]) resources.current.set(resourceKey(id, next), payload);
-    setLiveData(true); showResource(id, sectionRef.current, resources.current.get(resourceKey(id, sectionRef.current)) || reportResources.overview || overviewFromReport(report));
+  const load = async (id = connectionId) => {
+    if (!id) { setLoading(false); return; }
+    setLoading(true); setError('');
+    try {
+      const result = await fetchDashboardResource(id, 'overview');
+      if (result.collecting) setProgress('Analysis is still collecting. Refresh analysis to stream its progress.');
+      else { setOverview(result.payload as Overview); setProgress(''); }
+    } catch (reason) { setError(reason instanceof Error ? reason.message : 'Could not load the dashboard.'); }
+    finally { setLoading(false); }
   };
 
-  const waitForRun = async (id: string, runId: string, label: string): Promise<Row | null> => {
-    const response = await authFetch(`/connections/${id}/collection-runs/${runId}/stream`); if (!response.ok) throw new Error(`Could not start ${label}.`); let ready: Row | null = null;
-    await consumeSse(response, (event, item) => { if (event === 'error') throw new Error(String(item.error || item.error_message || `${label} failed.`)); if (event === 'data_ready') { ready = item; return true; } setProgress(event === 'complete' ? '' : `${label} · ${item.stage || item.status || item.message || 'collecting'}`); return false; });
-    return ready;
+  useEffect(() => {
+    void authJson<{ data: Connection[] }>('/connections').then(result => {
+      const requested = params.get('connection');
+      const selected = result.data.some(item => item.connection_id === requested) ? requested || '' : result.data[0]?.connection_id || '';
+      setConnections(result.data); setConnectionId(selected);
+    }).catch(reason => { setError(reason.message); setLoading(false); });
+  }, [params]);
+  useEffect(() => { void load(connectionId); }, [connectionId]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const refresh = async () => {
+    if (!connectionId) return;
+    setRefreshing(true); setError(''); setProgress('Starting database analysis…');
+    try {
+      const response = await authFetch(`/connections/${connectionId}/dashboard/refresh/stream`, { method: 'POST' });
+      if (!response.ok) throw new Error('Could not start analysis.');
+      await consumeSse(response, async (event, data) => {
+        if (event === 'error') throw new Error(String(data.error || data.message || 'Analysis failed.'));
+        if (event === 'data_ready') {
+          const report = await authJson<JsonRecord>(String(data.preview));
+          setOverview(overviewFromReport(report.report as JsonRecord) as Overview);
+          setProgress('');
+          return true;
+        }
+        setProgress(String(data.status || data.message || data.stage || 'Collecting database signals…'));
+        return false;
+      });
+    } catch (reason) { setError(reason instanceof Error ? reason.message : 'Could not refresh analysis.'); setProgress(''); }
+    finally { setRefreshing(false); }
   };
 
-  const upgrade = async (id: string) => {
-    const runId = deepRuns.current.get(id); deepRuns.current.delete(id); if (!runId) return;
-    try { const ready = await waitForRun(id, runId, 'Full analysis'); if (ready?.preview) { applyPreview(id, (await json(String(ready.preview))).report as Row); setProgress(''); return; } invalidateDashboardConnection(id); await load('overview', id); }
-    catch (reason) { setError(reason instanceof Error ? reason.message : 'Full analysis failed.'); }
-  };
+  const health = overview.health_summary || {};
+  const critical = Number(health.critical || 0);
+  const warning = Number(health.warning || 0);
+  const healthLabel = critical ? 'Critical' : warning ? 'Needs attention' : 'Healthy';
+  const slowest = overview.top_slow_queries?.[0];
+  const queryTime = number(slowest?.mean_exec_time, ' ms');
+  const selectedName = connections.find(item => item.connection_id === connectionId)?.display_name || 'database';
+  const findings = (overview.insights || []).filter(finding => !query || `${value(finding, 'title')} ${value(finding, 'action')} ${value(finding, 'severity')}`.toLowerCase().includes(query.toLowerCase()));
+  const contextual = (path: string) => `${path}?connection=${encodeURIComponent(connectionId)}`;
 
-  const collectBrief = async (id: string) => {
-    const runId = briefRuns.current.get(id) || String((await json(`/connections/${id}/brief/refresh`, { method: 'POST' })).run_id); briefRuns.current.delete(id);
-    const ready = await waitForRun(id, runId, 'Collecting database signals'); if (ready?.preview) applyPreview(id, (await json(String(ready.preview))).report as Row); else await load('overview', id); setProgress(''); void upgrade(id);
-  };
-
-  const load = async (next = section, id = connectionId) => {
-    if (!id) return; setSection(next); setError(''); const present = resources.current.get(resourceKey(id, next));
-    if (present) { showResource(id, next, present); return; }
-    controller.current?.abort(); controller.current = new AbortController(); const current = ++request.current; setLoadingSection(next);
-    try { const result = await fetchDashboardResource(id, next, controller.current.signal); if (current !== request.current) return; if (result.collecting) { if (next === 'overview') void collectBrief(id); return; } showResource(id, next, result.payload, result.cached); }
-    catch (reason) { if ((reason as Error).name !== 'AbortError' && current === request.current) { setLoadingSection(null); setError(reason instanceof Error ? reason.message : 'Could not load this view.'); } }
-  };
-
-  useEffect(() => { void json('/connections').then(result => { const list = rows(result) as Connection[]; const selected = searchParams.get('connection'); setConnections(list); setConnectionId(list.some(item => item.connection_id === selected) ? selected || '' : list[0]?.connection_id || ''); setModal(!list.length); }).catch(reason => setError(reason.message)); }, [searchParams]);
-  useEffect(() => { if (!connectionId) return; setLiveData(false); setSection('overview'); setDisplayedSection('overview'); setData({}); void load('overview', connectionId); }, [connectionId]); // eslint-disable-line react-hooks/exhaustive-deps
-  const refresh = async () => { if (!connectionId) return; setProgress('Collecting database signals'); try { const response = await authFetch(`/connections/${connectionId}/dashboard/refresh/stream`, { method: 'POST' }); if (!response.ok) throw new Error('Could not start analysis.'); await consumeSse(response, async (event, item) => { if (event === 'error') throw new Error(String(item.error || 'Analysis failed.')); if (event === 'data_ready') { applyPreview(connectionId, (await json(String(item.preview))).report as Row); setProgress(''); return true; } setProgress(String(item.status || item.message || item.stage || 'Collecting database signals')); return false; }); } catch (reason) { setProgress(''); setError(reason instanceof Error ? reason.message : 'Could not refresh.'); } };
-  const overview = data as Row & { health_summary?: Row; database_stats?: Row; insights?: Row[]; top_slow_queries?: Row[] };
-
-  return <div className="min-h-screen bg-[#050c1a] text-voyager-text-primary">
-    <main className="min-w-0"><header className="sticky top-0 z-30 flex h-14 items-center justify-between border-b border-slate-700/70 bg-[#0f1418]/95 px-4 backdrop-blur md:px-8"><div className="flex items-center gap-3"><span className="rounded border border-slate-600 bg-slate-800 px-2 py-1 font-mono text-[10px] tracking-widest"><i className="mr-2 inline-block h-2 w-2 rounded-full bg-emerald-400" />PRODUCTION</span><select value={connectionId} onChange={event => { controller.current?.abort(); setLiveData(false); setData({}); setConnectionId(event.target.value); }} className="bg-transparent text-sm font-semibold outline-none">{connections.map(item => <option className="bg-[#0f1418]" key={item.connection_id} value={item.connection_id}>{item.display_name}</option>)}</select><select aria-label="Dashboard view" value={section} onChange={event => void load(event.target.value as Section)} className="bg-transparent text-sm outline-none"><option value="overview">Overview</option><option value="statistics">Full statistics</option><option value="slow-queries">SQL observability</option><option value="statistics/tables">Table statistics</option><option value="statistics/indexes">Index statistics</option><option value="statistics/locks">Lock statistics</option><option value="schema-diagram">ERD diagram</option><option value="settings">Settings</option></select><button onClick={() => void refresh()} className="rounded border border-emerald-400/60 px-3 py-1 text-sm text-emerald-300">⌁ Connect</button></div><div className="hidden rounded-full border border-slate-600 bg-[#0a0f13] px-4 py-1 text-sm text-slate-500 lg:block">⌕ Search (Ctrl+K)</div></header>
-      <div className="mx-auto max-w-[1600px] p-4 md:p-8">{error && <p role="alert" className="mb-4 border border-red-400/40 bg-red-500/10 p-3 text-sm text-red-200">{error}</p>}{liveData && !progress && <p className="mb-4 border border-[#89ceff]/30 bg-[#89ceff]/10 px-4 py-2 font-mono text-[11px] tracking-wider text-[#b8e5ff]">● LIVE DATABASE DATA — durable snapshot queued in the background</p>}{progress && !Object.keys(data).length ? <CollectionStage progress={progress} /> : !connectionId ? <EmptyState onConnect={() => setModal(true)} /> : <div className="relative transition-opacity duration-200"><div key={displayedSection} className={`panel-in ${loadingSection ? 'pointer-events-none opacity-55' : 'opacity-100'}`}>{displayedSection === 'overview' ? <Overview overview={overview} onSection={next => void load(next)} /> : <ResourceView section={displayedSection} data={data} connectionId={connectionId} />}</div>{loadingSection && <PanelLoading section={loadingSection} />}</div>}{cached && !progress && <p className="mt-4 text-right font-mono text-[10px] tracking-wider text-slate-500">REDIS / BROWSER CACHE HIT</p>}</div>
-    </main>{modal && <ConnectionModal onClose={() => setModal(false)} onCreated={connection => { if (connection.brief_run_id) briefRuns.current.set(connection.connection_id, connection.brief_run_id); if (connection.deep_analysis_run_id) deepRuns.current.set(connection.connection_id, connection.deep_analysis_run_id); setConnections(current => [...current, connection]); setConnectionId(connection.connection_id); setSection('overview'); setModal(false); }} />}
-  </div>;
+  return <section className="mx-auto max-w-[1400px] p-6 md:p-10">
+    <header className="mb-8 flex flex-col justify-between gap-4 lg:flex-row lg:items-end"><div><p className="font-mono text-xs tracking-[.16em] text-voyager-blue">MISSION CONTROL</p><h1 className="mt-2 font-display text-3xl font-semibold">Database overview</h1><p className="mt-2 text-base text-voyager-text-secondary">The signals that need attention for {selectedName}.</p></div><div className="flex flex-wrap gap-3"><select value={connectionId} onChange={event => { setConnectionId(event.target.value); setParams({ connection: event.target.value }); }} className="ui-input m-0 w-auto" aria-label="Selected database">{connections.map(item => <option key={item.connection_id} value={item.connection_id}>{item.display_name}</option>)}</select><button type="button" onClick={() => void refresh()} disabled={!connectionId || refreshing} className="ui-button ui-button-primary">{refreshing && icon('progress_activity', 'animate-spin')}Refresh analysis</button></div></header>
+    {error && <p role="alert" className="mb-5 border border-red-400/40 bg-red-500/10 p-4 text-sm text-red-200">{error}</p>}
+    {progress && <p aria-live="polite" className="mb-5 border border-voyager-blue/30 bg-voyager-blue/10 p-4 text-sm text-voyager-text-secondary">{progress}</p>}
+    {!connectionId && !loading ? <EmptyState /> : loading ? <DashboardSkeleton /> : <><div className="grid gap-5 md:grid-cols-3"><Metric label="Database health" value={healthLabel} detail={critical ? `${critical} critical finding${critical === 1 ? '' : 's'}` : warning ? `${warning} warning${warning === 1 ? '' : 's'}` : 'No critical findings'} tone={critical ? 'text-red-300' : warning ? 'text-amber-300' : 'text-emerald-300'} /><Metric label="Active alerts" value={number(critical + warning)} detail="Open critical and warning findings" tone="text-voyager-blue-light" /><Metric label="Slowest query" value={queryTime} detail="Highest observed mean execution time" tone="text-voyager-text-primary" /></div><section className="mt-8 voyager-card overflow-hidden"><header className="flex flex-wrap items-center justify-between gap-3 border-b border-voyager-border px-5 py-4"><div><h2 className="font-display text-xl font-semibold">Recent findings</h2><p className="mt-1 text-sm text-voyager-text-secondary">Latest collected database signals.</p></div><Link to={contextual('/health-checks')} className="ui-button ui-button-ghost">Open health checks {icon('arrow_forward')}</Link></header>{findings.length ? <div className="divide-y divide-voyager-border">{findings.slice(0, 5).map((finding, index) => <article key={`${value(finding, 'title')}-${index}`} className="flex flex-col gap-3 px-5 py-4 sm:flex-row sm:items-center"><span className={`ui-badge w-fit ${value(finding, 'severity') === 'critical' ? 'border-red-400/40 text-red-300' : value(finding, 'severity') === 'warning' ? 'border-amber-400/40 text-amber-300' : 'text-voyager-blue-light'}`}>{value(finding, 'severity').toUpperCase()}</span><div className="min-w-0 flex-1"><h3 className="font-medium">{value(finding, 'title')}</h3><p className="mt-1 text-sm text-voyager-text-secondary">{value(finding, 'action')}</p></div></article>)}</div> : <p className="p-6 text-sm text-voyager-text-secondary">No recent findings match this search.</p>}</section><nav className="mt-8 grid gap-4 md:grid-cols-3" aria-label="Database tools"><ModuleLink to={contextual('/health-checks')} iconName="auto_graph" title="Health checks" description="Review and acknowledge database findings." /><ModuleLink to={contextual('/optimizer')} iconName="query_stats" title="Query optimizer" description="Investigate persisted slow-query snapshots." /><ModuleLink to={contextual('/schema-explorer')} iconName="table_chart" title="Schema explorer" description="Inspect tables, indexes, and relationships." /></nav></>}
+  </section>;
 }
 
-function Overview({ overview, onSection }: { overview: Row & { health_summary?: Row; database_stats?: Row; insights?: Row[]; top_slow_queries?: Row[] }; onSection: (section: Section) => void }) {
-  const critical = Number(overview.health_summary?.critical || 0), warning = Number(overview.health_summary?.warning || 0), tables = Number(overview.table_count || 0), stats = overview.database_stats || {};
-  const metrics = [['PG ERRORS', critical, 'Last collection', 'text-red-300'], ['QUERY SPD', number(overview.top_slow_queries?.[0]?.mean_exec_time) + 'ms', 'Top average', 'text-[#89ceff]'], ['CONNS', number(stats.num_connections), '/' + number(stats.max_connections), ''], ['BLOAT', warning, 'Signals', 'text-amber-300'], ['HEALTH', critical ? 'C' : warning ? 'B' : 'A', '/100', 'text-[#89ceff]'], ['TABLES', tables, 'Scanned', '']];
-  return <div className="space-y-8"><section className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-6">{metrics.map(([label, metric, note, color]) => <article key={String(label)} className="voyager-card voyager-glow rounded-md p-4"><div className="flex justify-between font-mono text-[10px] tracking-widest text-slate-400"><span>{label}</span><span>⌁</span></div><p className={`mt-5 font-mono text-3xl ${color}`}>{metric}<small className="ml-1 text-xs text-slate-400">{note}</small></p></article>)}</section><section><div className="mb-4 flex items-center justify-between"><h2 className="font-display text-xl font-semibold">✦ DB Voyager Agent found {critical + warning} issues</h2><button onClick={() => onSection('health-checks')} className="text-sm text-[#89ceff]">View all alerts ›</button></div><div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">{(overview.insights || []).slice(0, 4).map((item, index) => <InsightCard key={index} item={item} />)}{!(overview.insights || []).length && <p className="voyager-card p-5 text-sm text-slate-400">No urgent database signals were found.</p>}</div></section><section className="grid gap-4 xl:grid-cols-[1.45fr_.9fr]"><AgentPanel onSection={onSection} slow={overview.top_slow_queries || []} /><HealthScore critical={critical} warning={warning} /></section><section className="grid gap-4 xl:grid-cols-2"><SchemaInsights onSection={onSection} tables={tables} /><AuditTrail /></section></div>;
-}
-
-function InsightCard({ item }: { item: Row }) { const severity = value(item, 'severity', 'info'); const critical = severity === 'critical'; return <article className={`voyager-card border-l-4 p-4 ${critical ? 'border-l-red-300' : 'border-l-amber-300'}`}><div className="mb-3 flex justify-between"><span className={`px-2 py-0.5 font-mono text-[10px] ${critical ? 'bg-red-800 text-red-100' : 'bg-amber-500 text-slate-950'}`}>{severity.toUpperCase()}</span><span className="font-mono text-[10px] text-slate-500">DATABASE</span></div><h3 className="font-semibold">{value(item, 'title')}</h3><p className="mt-2 text-sm leading-6 text-slate-300">{value(item, 'action')}</p></article>; }
-function AgentPanel({ onSection, slow }: { onSection: (section: Section) => void; slow: Row[] }) { return <section className="voyager-card overflow-hidden"><header className="flex items-center justify-between border-b border-slate-600/60 p-5"><h2 className="font-display text-xl font-semibold">✦ AI Voyager Agent <span className="ml-2 rounded bg-emerald-500/15 px-2 py-1 font-mono text-[10px] text-emerald-300">● LIVE</span></h2><span>⋮</span></header><div className="space-y-4 p-5"><div className="ml-auto max-w-[80%] border border-slate-600 bg-[#252b2f] p-4 text-sm">Monitoring your database health and query telemetry.</div><div className="max-w-[90%] border border-[#89ceff]/20 bg-[#0a0f13] p-4 text-sm text-slate-200">{slow.length ? `I found ${slow.length} high-impact query signals. Open the optimizer for a read-only recommendation.` : 'I am ready to analyze incoming database signals.'}<button onClick={() => onSection('optimizer')} className="mt-4 block border border-[#89ceff]/50 px-3 py-2 text-[#89ceff]">Open optimizer</button></div></div><div className="border-t border-slate-600/60 p-4"><div className="flex items-center justify-between border border-[#89ceff]/40 bg-[#050c1a] px-4 py-3 text-sm text-slate-500">Ask Voyager anything about your database… <span className="text-[#89ceff]">▷</span></div></div></section>; }
-function HealthScore({ critical, warning }: { critical: number; warning: number }) { const score = Math.max(0, 100 - critical * 25 - warning * 8), grade = score >= 85 ? 'A' : score >= 70 ? 'B+' : score >= 50 ? 'C' : 'D'; return <section className="voyager-card grid place-items-center p-8 text-center"><div className="grid h-44 w-44 place-items-center rounded-full border-[13px] border-[#89ceff] shadow-glow"><div><p className="font-mono text-5xl text-[#89ceff]">{grade}</p><p className="font-mono text-xs tracking-widest">HEALTH SCORE</p></div></div><p className="mt-6 max-w-sm text-sm text-slate-300">{number(score)}/100 based on live collection signals and database health checks.</p></section>; }
-function SchemaInsights({ onSection, tables }: { onSection: (section: Section) => void; tables: number }) { return <section className="voyager-card overflow-hidden"><header className="flex justify-between border-b border-slate-600/60 p-4"><h2 className="font-display font-semibold">▦ Schema Insights</h2><button onClick={() => onSection('schema')} className="text-sm text-[#89ceff]">Scan schema</button></header><div className="grid grid-cols-3 border-b border-slate-600/60 px-4 py-3 font-mono text-[10px] tracking-widest text-slate-400"><span>NAME</span><span>ROWS</span><span>HEALTH</span></div>{tables ? <div className="grid grid-cols-3 px-4 py-4 text-sm"><span>Collected tables</span><span>{tables}</span><span className="text-emerald-300">● READY</span></div> : <p className="p-4 text-sm text-slate-400">Run analysis to collect schema metadata.</p>}</section>; }
-function AuditTrail() { return <section className="voyager-card p-4"><h2 className="font-display font-semibold">◴ Fix Audit Trail</h2><div className="mt-5 space-y-4 text-sm"><p className="border-b border-slate-700 pb-3 text-slate-300">● Collection uses cached dashboard resources when available.</p><p className="border-b border-slate-700 pb-3 text-slate-300">◌ Read-only target database access is enforced.</p><p className="text-slate-500">All recommendations require explicit execution outside this dashboard.</p></div></section>; }
-function ResourceView({ section, data, connectionId }: { section: Section; data: Row; connectionId: string }) { const records = rows(data); const title = section.replaceAll('-', ' ').replaceAll('/', ' / '); if (section === 'statistics') return <StatisticsDashboard data={data} />; if (section === 'schema') return <SchemaDashboard data={data} />; if (section === 'schema-diagram') return <Diagram data={data} />; return <section className="voyager-card overflow-hidden"><header className="flex items-center justify-between border-b border-slate-600/60 p-5"><div><p className="font-mono text-[10px] tracking-widest text-[#89ceff]">LIVE RESOURCE</p><h1 className="mt-1 font-display text-2xl font-semibold">{title}</h1></div><span className="rounded border border-emerald-400/40 px-2 py-1 font-mono text-[10px] text-emerald-300">CACHED API</span></header>{section === 'optimizer' ? <div className="space-y-4 p-5">{records.length ? records.map(row => <article key={value(row, 'query_id')} className="border border-slate-700 bg-[#0a0f13] p-4"><code className="sql-text break-all text-[#c9e6ff]">{value(row, 'query')}</code><Link to={`/connections/${encodeURIComponent(connectionId)}/optimizer/queries/${encodeURIComponent(value(row, 'query_id'))}`} className="mt-4 inline-block border border-[#89ceff]/50 px-3 py-2 text-sm text-[#89ceff]">Analyze safely</Link></article>) : <p className="text-slate-400">No stored slow queries are available.</p>}</div> : <DataGrid records={records} />}</section>; }
-function StatisticsDashboard({ data }: { data: Row }) { const statistics = record(data.data); return <section className="space-y-5"><header><p className="font-mono text-[10px] tracking-widest text-[#89ceff]">COMPLETE INSPECTOR SNAPSHOT</p><h1 className="mt-1 font-display text-3xl font-semibold">Database statistics</h1></header><InspectorGroup title="Database statistics" records={[record(statistics.database_stats)]} /><InspectorGroup title="Query statistics" records={rows({ data: statistics.query_stats })} /><InspectorGroup title="Table statistics" records={rows({ data: statistics.table_stats })} /><InspectorGroup title="Index statistics" records={rows({ data: statistics.index_stats })} /><InspectorGroup title="Lock statistics" records={rows({ data: statistics.lock_stats })} /></section>; }
-function SchemaDashboard({ data }: { data: Row }) { const schema = record(data.data); return <section className="space-y-5"><header><p className="font-mono text-[10px] tracking-widest text-[#89ceff]">COMPLETE SCHEMA INSPECTION</p><h1 className="mt-1 font-display text-3xl font-semibold">Schema explorer</h1></header><InspectorGroup title="Tables" records={rows({ data: schema.tables })} /><InspectorGroup title="Columns" records={rows({ data: schema.columns })} /><InspectorGroup title="Primary keys" records={rows({ data: schema.primary_keys })} /><InspectorGroup title="Foreign keys" records={rows({ data: schema.foreign_keys })} /><InspectorGroup title="Indexes" records={rows({ data: schema.indexes })} /><InspectorGroup title="Relations" records={rows({ data: schema.relations })} /></section>; }
-function InspectorGroup({ title, records }: { title: string; records: Row[] }) { return <section className="voyager-card overflow-hidden"><header className="flex items-center justify-between border-b border-slate-600/60 px-5 py-4"><h2 className="font-display text-lg font-semibold">{title}</h2><span className="font-mono text-xs text-[#89ceff]">{records.length} records</span></header><DataGrid records={records} /></section>; }
-function DataGrid({ records }: { records: Row[] }) { if (!records.length) return <p className="p-6 text-sm text-slate-400">No collected records are available for this inspector component.</p>; const columns = [...new Set(records.flatMap(Object.keys))]; return <div className="overflow-auto"><table className="w-full min-w-max text-left text-sm"><thead className="bg-[#0a0f13] font-mono text-[10px] tracking-widest text-slate-400"><tr>{columns.map(column => <th key={column} className="px-5 py-3">{column.replaceAll('_', ' ')}</th>)}</tr></thead><tbody>{records.map((row, index) => <tr key={index} className="border-t border-slate-700/70">{columns.map(column => <td key={column} className="max-w-sm px-5 py-4 text-slate-300">{typeof row[column] === 'object' ? JSON.stringify(row[column]) : value(row, column)}</td>)}</tr>)}</tbody></table></div>; }
-function Diagram({ data }: { data: Row }) { const source = typeof data.data === 'string' ? data.data : ''; const tables = [...source.matchAll(/^\s*([A-Z][A-Z0-9_]*) \{$([\s\S]*?)^\s*\}/gm)].map(match => ({ name: match[1], fields: match[2].trim().split('\n').filter(Boolean) })); return <section className="space-y-4"><h1 className="font-display text-2xl font-semibold">Schema ERD</h1><div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">{tables.map(table => <article key={table.name} className="voyager-card overflow-hidden"><h2 className="bg-[#89ceff]/15 p-3 font-mono text-[#89ceff]">{table.name}</h2>{table.fields.map(field => <p key={field} className="border-t border-slate-700 px-3 py-2 font-mono text-xs text-slate-300">{field}</p>)}</article>)}</div>{!tables.length && <p className="voyager-card p-5 text-slate-400">ERD will appear after schema collection.</p>}</section>; }
-function PanelLoading({ section }: { section: Section }) { return <div aria-live="polite" className="absolute inset-0 grid place-items-center bg-[#050c1a]/45 backdrop-blur-[1px]"><div className="border border-[#89ceff]/30 bg-[#0d1f38] px-5 py-4 text-center shadow-glow"><span className="mx-auto mb-2 block h-7 w-7 animate-spin rounded-full border-2 border-[#89ceff]/25 border-t-[#89ceff]" /><p className="font-mono text-[10px] tracking-[.16em] text-[#89ceff]">LOADING {section.replaceAll('/', ' / ').toUpperCase()}</p></div></div>; }
-function CollectionStage({ progress }: { progress: string }) { return <section aria-live="polite" className="grid min-h-[65vh] place-items-center"><div className="w-full max-w-xl border border-[#89ceff]/30 bg-[#0d1f38] p-10 text-center shadow-glow"><div className="mx-auto h-20 w-20 animate-spin rounded-full border-4 border-[#89ceff]/20 border-t-[#89ceff]" /><p className="mt-8 font-mono text-xs tracking-[.2em] text-[#89ceff]">LIVE COLLECTION</p><h1 className="mt-3 font-display text-3xl font-bold">Building your database view</h1><p className="mt-4 text-slate-300">{progress}</p></div></section>; }
-function EmptyState({ onConnect }: { onConnect: () => void }) { return <section className="grid min-h-[65vh] place-items-center text-center"><div><p className="font-mono text-xs tracking-[.2em] text-[#89ceff]">MISSION CONTROL</p><h1 className="mt-4 font-display text-4xl font-bold">Connect a database to begin.</h1><button onClick={onConnect} className="mt-6 bg-[#89ceff] px-5 py-3 font-semibold text-[#00344d]">Connect PostgreSQL</button></div></section>; }
-function ConnectionModal({ onClose, onCreated }: { onClose: () => void; onCreated: (connection: Connection) => void }) { const [displayName, setDisplayName] = useState(''); const [connectionUrl, setConnectionUrl] = useState(''); const [error, setError] = useState(''); const submit = async (event: React.FormEvent) => { event.preventDefault(); try { const url = new URL(connectionUrl); await json('/connections/test', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ display_name: displayName, connection_url: connectionUrl }) }); const created = await json('/connections', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ display_name: displayName, connection_url: connectionUrl }) }); onCreated({ connection_id: String(created.connection_id), display_name: displayName || url.pathname.slice(1), brief_run_id: typeof created.brief_run_id === 'string' ? created.brief_run_id : undefined, deep_analysis_run_id: typeof created.deep_analysis_run_id === 'string' ? created.deep_analysis_run_id : undefined }); } catch (reason) { setError(reason instanceof Error ? reason.message : 'Could not connect.'); } }; return <div className="fixed inset-0 z-50 grid place-items-center bg-black/75 p-4 backdrop-blur"><form onSubmit={submit} className="w-full max-w-lg border border-[#89ceff]/30 bg-[#0d1f38] p-6"><div className="flex justify-between"><h2 className="font-display text-2xl font-bold">Connect PostgreSQL</h2><button type="button" onClick={onClose}>×</button></div><label className="mt-5 block text-sm">Connection name<input value={displayName} onChange={event => setDisplayName(event.target.value)} className="auth-input" placeholder="Production" /></label><label className="mt-4 block text-sm">PostgreSQL connection URL<input required type="url" value={connectionUrl} onChange={event => setConnectionUrl(event.target.value)} className="auth-input" placeholder="postgresql://user:password@host:5432/database?sslmode=require" /></label>{error && <p className="mt-4 text-sm text-red-300">{error}</p>}<button className="mt-6 w-full bg-[#89ceff] p-3 font-semibold text-[#00344d]">Test & connect</button></form></div>; }
+function Metric({ label, value: metric, detail, tone }: { label: string; value: string; detail: string; tone: string }) { return <article className="voyager-card p-5"><p className="font-mono text-xs tracking-widest text-voyager-text-secondary">{label.toUpperCase()}</p><p className={`mt-4 font-display text-3xl font-semibold ${tone}`}>{metric}</p><p className="mt-2 text-sm text-voyager-text-secondary">{detail}</p></article>; }
+function ModuleLink({ to, iconName, title, description }: { to: string; iconName: string; title: string; description: string }) { return <Link to={to} className="voyager-card voyager-glow p-5"><span className="text-voyager-blue">{icon(iconName)}</span><h2 className="mt-4 font-display text-lg font-semibold">{title}</h2><p className="mt-2 text-sm text-voyager-text-secondary">{description}</p></Link>; }
+function EmptyState() { return <div className="grid min-h-[50vh] place-items-center text-center"><div><p className="font-mono text-xs tracking-[.16em] text-voyager-blue">MISSION CONTROL</p><h2 className="mt-3 font-display text-3xl">Connect a database to begin.</h2><Link to="/connections" className="ui-button ui-button-primary mt-6">New connection</Link></div></div>; }
+function DashboardSkeleton() { return <div aria-label="Loading dashboard" className="grid gap-5 md:grid-cols-3">{[0, 1, 2].map(item => <div key={item} className="h-36 animate-pulse rounded-lg bg-voyager-surface" />)}</div>; }

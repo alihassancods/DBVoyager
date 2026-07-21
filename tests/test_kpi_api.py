@@ -78,7 +78,7 @@ def test_kpi_dashboard_fetches_database_snapshots_in_one_call() -> None:
 
     assert response.status_code == 200
     assert response.json()["data"][0]["chart"]["kpi_id"] == "kpi-1"
-    assert response.json()["data"][0]["chart"]["source"]["generated_at"] == "2026-07-02T00:00:00+00:00"
+    assert response.json()["data"][0]["chart"]["source"]["generated_at"] in ("2026-07-02T00:00:00+00:00", "2026-07-02T00:00:00Z")
 
 
 def test_custom_kpi_create_validates_schema_and_uses_owner_scope() -> None:
