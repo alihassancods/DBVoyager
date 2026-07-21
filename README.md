@@ -43,7 +43,7 @@ It watches your database 24/7, investigates what changed, and prepares safe, act
 
 ## 🔗 Quick Links
 
-* 🌐 **Live Web Application:** [https://db-voyager.vercel.app/](https://db-voyager.vercel.app/)
+* 🌐 **Live Web Application:** [https://dbvoyager.alihassancodes.com/](https://dbvoyager.alihassancodes.com/)
 * 🎬 **Video Demo:** [Watch on YouTube](https://www.youtube.com/results?search_query=DBVoyager+demo)
 
 ---
