@@ -7,11 +7,12 @@
 
   <p>
     <a href="#features"><img src="https://img.shields.io/badge/AI_Agents-7_teams-3b82f6?style=flat-square" alt="AI Agents"></a>
+    <a href="#tech-stack"><img src="https://img.shields.io/badge/DeepSeek-LLM-4F46E5?style=flat-square" alt="GPT-5.6 LLM"></a>
     <a href="#tech-stack"><img src="https://img.shields.io/badge/Python-3.14+-3776AB?style=flat-square&logo=python&logoColor=white" alt="Python 3.14+"></a>
     <a href="#tech-stack"><img src="https://img.shields.io/badge/FastAPI-0.139-009688?style=flat-square&logo=fastapi&logoColor=white" alt="FastAPI"></a>
     <a href="#tech-stack"><img src="https://img.shields.io/badge/React-18-61DAFB?style=flat-square&logo=react&logoColor=white" alt="React 18"></a>
     <a href="#tech-stack"><img src="https://img.shields.io/badge/PostgreSQL-16-4169E1?style=flat-square&logo=postgresql&logoColor=white" alt="PostgreSQL"></a>
-    <a href="#tech-stack"><img src="https://img.shields.io/badge/DeepSeek-LLM-4F46E5?style=flat-square" alt="DeepSeek LLM"></a>
+    <a href="#tech-stack"><img src="https://img.shields.io/badge/DeepSeek-LLM-4F46E5?style=flat-square" alt="GPT-5.6 LLM"></a>
     <br>
     <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" alt="MIT License"></a>
     <a href="https://www.youtube.com/results?search_query=DBVoyager+demo"><img src="https://img.shields.io/badge/demo-video-ff0000?style=flat-square&logo=youtube&logoColor=white" alt="Demo"></a>
