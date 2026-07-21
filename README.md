@@ -21,7 +21,7 @@
   </p>
 </div>
 
-> 🌐 **Live Web Application:** [https://db-voyager.vercel.app/](https://db-voyager.vercel.app/)
+> 🌐 **Live Web Application:** [https://dbvoyager.alihassancodes.com/](https://dbvoyager.alihassancodes.com/)
 
 ---
 
