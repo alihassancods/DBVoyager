@@ -421,6 +421,28 @@ DBVoyager was built using:
 
 to create an intelligent platform that bridges the gap between database engineering and business decision making.
 
+## Built with GPT-5.6 and Codex
+
+DBVoyager was developed using both GPT-5.6 and Codex.
+
+### GPT-5.6
+- Business question understanding
+- SQL generation planning
+- Executive summary generation
+- Risk analysis
+- KPI interpretation
+- Database health reporting
+
+### Codex
+- FastAPI endpoint generation
+- Database inspector implementation
+- Test generation
+- Frontend scaffolding
+- Refactoring and debugging assistance
+- SQL validation implementation
+
+The combination of GPT-5.6 and Codex allowed us to rapidly prototype, validate, and iterate on a production-style database intelligence platform during the hackathon.
+
 # Final Statement
 
 Instead of requiring non-techinical users like the CEO, Managers to understand SQL, indexes, execution plans, and database internals, DBVoyager allows them to interact with their data through natural language while still delivering professional grade analysis and recommendations.
