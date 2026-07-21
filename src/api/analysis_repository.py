@@ -16,14 +16,20 @@ from fastapi import HTTPException, status
 from psycopg2.extras import Json, execute_values
 
 from src.agent import TableBusinessSummaryAgent, TableSummaryInput
+from src.agent.business_intelligence.analysis_agent import AnalysisAgent
+from src.agent.health.executive_summary_agent import ExecutiveSummaryAgent
 from src.agent.kpi import generate_kpis
+from src.agent.kpi.repository import KPIRepository
+from src.models.business_intelligence.investigation_plan import InvestigationPlan
+from src.models.business_intelligence.sql_result import SQLResult
 from .brief import collect_brief
-from .resource_cache import publish_preview, warm_json
+from .resource_cache import invalidate, publish_preview, warm_json
 from v1 import build_report
 
 
 ConnectionProvider = Callable[[], Any]
 ProgressCallback = Callable[[str, str], None]
+SectionCallback = Callable[[str, dict[str, Any]], None]
 _progress_events: dict[str, list[dict[str, str]]] = {}
 _progress_lock = Lock()
 
@@ -176,6 +182,22 @@ def run_scheduled_collection(run_id: str, connection_id: str, collection_kind: s
         _mark_failed(run_id, f"{type(exc).__name__}: {exc}")
 
 
+def has_active_analysis(connection_id: str) -> bool:
+    """Check if any analysis run is currently queued or running for this connection."""
+    try:
+        with _app_connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """SELECT 1 FROM analysis_runs
+                       WHERE monitored_database_id = %s AND status IN ('queued', 'running')
+                       LIMIT 1""",
+                    (connection_id,),
+                )
+                return cursor.fetchone() is not None
+    except (HTTPException, psycopg2.Error):
+        return False
+
+
 def prune_database_history(connection_id: str) -> None:
     """Keep detailed operational data for 30 days after the daily deep run."""
     with _app_connection() as connection:
@@ -222,6 +244,7 @@ def collect_analysis(
     connection_provider: ConnectionProvider,
     progress: ProgressCallback | None = None,
     collection_kind: str = "dashboard",
+    section_ready: SectionCallback | None = None,
 ) -> dict[str, Any]:
     """Collect a target-database report without app-database snapshot writes."""
     _set_running(run_id)
@@ -239,7 +262,7 @@ def collect_analysis(
         if collection_kind == "brief":
             report = {"brief": {"status": "ok", "data": collect_brief(connection_provider, progress)}}
         else:
-            report = build_report(database_name, connection_provider, progress, sections)
+            report = build_report(database_name, connection_provider, progress, sections, section_ready)
         _record_collection_metric(run_id, "collection", int((time.monotonic() - started) * 1000), len(json.dumps(report, default=str)))
         return report
     except Exception as exc:
@@ -278,6 +301,11 @@ def run_post_persist_enrichment(
         _record_progress(run_id, "kpis", f"KPI generation completed: {generated} metrics.")
     except Exception as exc:
         _record_progress(run_id, "kpis", f"KPI generation failed: {type(exc).__name__}.")
+    try:
+        _generate_agent_reports(connection_id, run_id, report)
+        _record_progress(run_id, "agents", "VoyagerAI Developer and BI reports saved.")
+    except Exception as exc:
+        _record_progress(run_id, "agents", f"VoyagerAI reports skipped: {type(exc).__name__}.")
     if schema is not None:
         try:
             _generate_table_summaries(
@@ -290,6 +318,45 @@ def run_post_persist_enrichment(
         prune_database_history(connection_id)
     except Exception as exc:
         _record_progress(run_id, "retention", f"Retention deferred: {type(exc).__name__}.")
+
+
+def _generate_agent_reports(connection_id: str, run_id: str, report: dict[str, Any]) -> None:
+    """Reuse the existing BI analysis agent over already-persisted, bounded snapshots."""
+    health = _ok_data(report, "health_checks") or []
+    statistics = _ok_data(report, "statistics") or {}
+    severity = "critical" if any(item.get("severity") == "critical" for item in health) else "warning" if any(item.get("severity") == "warning" for item in health) else "info"
+    repository = KPIRepository()
+    definitions = repository.list_definitions(connection_id)
+    snapshots = repository.latest_snapshots(connection_id)
+    reports = {
+        "developer": ("Developer technical report", {"health_findings": health[:10], "slow_queries": statistics.get("query_stats", [])[:10], "database_stats": statistics.get("database_stats", {})}),
+        "bi": ("BI KPI report", {"kpis": [{"title": item.title, "aggregation": item.aggregation, "points": snapshots.get(item.id, {}).get("points", [])[:12]} for item in definitions[:20]]}),
+    }
+    for kind, (title, payload) in reports.items():
+        if kind == "developer":
+            summary = ExecutiveSummaryAgent().summarize(100 if severity == "info" else 70 if severity == "warning" else 40, health)
+            evidence, recommendations = [str(item.get("message", item.get("check", "Finding"))) for item in health[:10]], ["Review the linked health checks and slow-query snapshots before applying any change."]
+        else:
+            insight = AnalysisAgent().analyze(
+                "Create a business recommendation-only report from these persisted KPI snapshots.",
+                InvestigationPlan(question=title, tables=[], metrics=[], dimensions=[]),
+                [SQLResult(sql="PERSISTED SNAPSHOT — DO NOT EXECUTE", rows=[payload])],
+            )
+            summary, evidence, recommendations = insight.summary, insight.evidence, insight.recommendations
+        saved = _save_agent_report(connection_id, run_id, kind, title, severity, {"summary": summary[:2000], "evidence": evidence[:10], "recommendations": recommendations[:10]})
+        from .notifications import AgentNotification, create_notification_for_connection
+        create_notification_for_connection(AgentNotification(connection_id=connection_id, idempotency_key=f"voyagerai:{kind}:{run_id}", severity=severity, title=f"VoyagerAI · {kind.title()}", body=summary[:2000], metadata={"agent_kind": kind, "report_id": saved, "source_run_id": run_id}))
+
+
+def _save_agent_report(connection_id: str, run_id: str, kind: str, title: str, severity: str, payload: dict[str, Any]) -> str:
+    with _app_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("""INSERT INTO agent_reports (monitored_database_id, analysis_run_id, agent_kind, title, severity, report_json)
+                              VALUES (%s, %s, %s, %s, %s, %s)
+                              ON CONFLICT (monitored_database_id, analysis_run_id, agent_kind)
+                              DO UPDATE SET title = EXCLUDED.title, severity = EXCLUDED.severity, report_json = EXCLUDED.report_json
+                              RETURNING id""", (connection_id, run_id, kind, title, severity, _json(payload)))
+            return str(cursor.fetchone()[0])
 
 
 def run_analysis(
@@ -539,6 +606,67 @@ def get_analysis_run(connection_id: str, run_id: str, auth_subject: str) -> dict
         "error_code": row[6],
         "error_message": row[7],
     }
+
+
+def list_analysis_runs(connection_id: str, auth_subject: str, limit: int = 20) -> list[dict[str, Any]]:
+    with _app_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT runs.id, runs.status, runs.trigger, runs.collection_kind,
+                       runs.created_at, runs.started_at, runs.finished_at,
+                       runs.error_code, runs.error_message,
+                       (SELECT count(*) FROM analysis_run_events WHERE analysis_run_id = runs.id) AS event_count
+                FROM analysis_runs AS runs
+                JOIN monitored_databases AS databases ON databases.id = runs.monitored_database_id
+                JOIN users ON users.id = databases.owner_user_id
+                WHERE runs.monitored_database_id = %s AND users.auth_subject = %s
+                ORDER BY runs.created_at DESC
+                LIMIT %s
+                """,
+                (connection_id, auth_subject, limit),
+            )
+            rows = cursor.fetchall()
+    return [
+        {
+            "id": str(row[0]),
+            "status": row[1],
+            "trigger": row[2],
+            "collection_kind": row[3],
+            "created_at": row[4].isoformat() if row[4] else None,
+            "started_at": row[5].isoformat() if row[5] else None,
+            "finished_at": row[6].isoformat() if row[6] else None,
+            "error_code": row[7],
+            "error_message": row[8],
+            "event_count": row[9],
+        }
+        for row in rows
+    ]
+
+
+def list_analysis_run_events(connection_id: str, run_id: str, auth_subject: str, offset: int = 0) -> list[dict[str, Any]]:
+    with _app_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT events.id, events.stage, events.message, events.created_at
+                FROM analysis_run_events AS events
+                JOIN analysis_runs AS runs ON runs.id = events.analysis_run_id
+                JOIN monitored_databases AS databases ON databases.id = runs.monitored_database_id
+                JOIN users ON users.id = databases.owner_user_id
+                WHERE events.analysis_run_id = %s
+                  AND runs.monitored_database_id = %s
+                  AND users.auth_subject = %s
+                  AND events.id > %s
+                ORDER BY events.id
+                """,
+                (run_id, connection_id, auth_subject, offset),
+            )
+            rows = cursor.fetchall()
+    return [
+        {"id": row[0], "stage": row[1], "message": row[2], "created_at": row[3].isoformat() if row[3] else None}
+        for row in rows
+    ]
 
 
 def ensure_owned_database(connection_id: str, auth_subject: str) -> None:
@@ -810,6 +938,15 @@ def _persist_report(
             )
             if progress:
                 progress("persistence", "Finalized analysis run status.")
+
+    resources = ["overview"]
+    if health_checks is not None:
+        resources.extend(("health-checks", "insights"))
+    if statistics is not None:
+        resources.append("slow-queries")
+    if schema is not None:
+        resources.extend(("schema", "optimization", "bi"))
+    invalidate(connection_id, *resources)
 
 
 def _persist_statistics(

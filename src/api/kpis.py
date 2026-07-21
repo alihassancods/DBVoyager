@@ -62,11 +62,8 @@ def _validate_candidate(repository: KPIRepository, connection_id: str, candidate
     return revision_id, candidate
 
 
-def _generate_and_invalidate(connection_id: str, provider: Any) -> None:
-    try:
-        generate_kpis(connection_id, provider)
-    finally:
-        invalidate(connection_id, "kpis/dashboard")
+def _generate(connection_id: str, provider: Any) -> None:
+    generate_kpis(connection_id, provider)
 
 
 @router.post("/generate", status_code=status.HTTP_202_ACCEPTED)
@@ -79,17 +76,17 @@ def generate_dashboard_kpis(
     owner = _owner_subject(user)
     _ensure_owned(connection_id, user)
     get_connection(connection_id, owner)
-    try:
-        KPIDiscoveryAgent().ensure_available()
-    except KPIDiscoveryUnavailable as exc:
-        repository.set_generation_status(
-            connection_id, "unavailable",
-            error_message="KPI generation is temporarily unavailable. Please try again later.",
-        )
-        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)) from exc
+    if not repository.list_definitions(connection_id):
+        try:
+            KPIDiscoveryAgent().ensure_available()
+        except KPIDiscoveryUnavailable as exc:
+            repository.set_generation_status(
+                connection_id, "unavailable",
+                error_message="KPI generation is temporarily unavailable. Please try again later.",
+            )
+            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)) from exc
     repository.set_generation_status(connection_id, "running")
-    invalidate(connection_id, "kpis/dashboard")
-    background_tasks.add_task(_generate_and_invalidate, connection_id, connection_provider(connection_id, owner))
+    background_tasks.add_task(_generate, connection_id, connection_provider(connection_id, owner))
     return {"status": "queued"}
 
 
@@ -222,7 +219,6 @@ def approve_candidate(
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"KPI execution failed: {type(exc).__name__}") from exc
-    invalidate(connection_id, "kpis/dashboard", f"kpis/chart:{definition.id}")
     return {"definition": definition.model_dump(), "chart": _chart(definition, {
         "analysis_run_id": snapshot.analysis_run_id,
         "points": snapshot.points,
@@ -264,7 +260,6 @@ def create_definition(
     _ensure_owned(connection_id, user)
     revision_id, candidate = _validate_candidate(repository, connection_id, candidate)
     definition = repository.create_definition(connection_id, revision_id, candidate)
-    invalidate(connection_id, "kpis/dashboard")
     return definition.model_dump()
 
 
@@ -281,7 +276,7 @@ def update_definition(
     definition = repository.update_definition(definition_id, connection_id, revision_id, candidate)
     if definition is None:
         raise HTTPException(status_code=404, detail="KPI definition not found")
-    invalidate(connection_id, "kpis/dashboard", f"kpis/chart:{definition_id}")
+    invalidate(connection_id, f"kpis/chart:{definition_id}")
     return definition.model_dump()
 
 
@@ -295,7 +290,7 @@ def delete_definition(
     _ensure_owned(connection_id, user)
     if not repository.delete_definition(definition_id, connection_id):
         raise HTTPException(status_code=404, detail="KPI definition not found")
-    invalidate(connection_id, "kpis/dashboard", f"kpis/chart:{definition_id}")
+    invalidate(connection_id, f"kpis/chart:{definition_id}")
 
 
 @router.get("/definitions/{definition_id}")
@@ -359,7 +354,7 @@ def refresh_definition(
         repository.save_snapshot(snapshot)
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"KPI execution failed: {type(exc).__name__}") from exc
-    invalidate(connection_id, "kpis/dashboard", f"kpis/chart:{definition_id}")
+    invalidate(connection_id, f"kpis/chart:{definition_id}")
     return _chart(definition, {
         "analysis_run_id": snapshot.analysis_run_id,
         "points": snapshot.points,
@@ -383,4 +378,4 @@ def latest_chart(
     snapshot = repository.latest_snapshot(definition_id, connection_id)
     if snapshot is None:
         raise HTTPException(status_code=404, detail="No KPI snapshot found")
-    return cached_json(request, connection_id, f"kpis/chart:{definition_id}", _chart(definition, snapshot))
+    return cached_json(request, connection_id, f"kpis/chart:{definition_id}", lambda: _chart(definition, snapshot))

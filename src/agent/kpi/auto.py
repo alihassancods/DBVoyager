@@ -18,16 +18,22 @@ def generate_kpis(
     repository = KPIRepository()
     repository.set_generation_status(monitored_database_id, "running", analysis_run_id)
     try:
-        context = repository.current_schema_context(monitored_database_id)
-        if context is None:
-            repository.set_generation_status(monitored_database_id, "succeeded", analysis_run_id)
-            return 0
-        schema_revision_id, schema, summaries = context
-        candidates = KPIDiscoveryAgent().discover(schema, summaries)
-        saved = repository.save_candidates(monitored_database_id, schema_revision_id, candidates)
-        for candidate_id, _ in saved:
-            repository.approve(candidate_id, monitored_database_id)
         definitions = repository.list_definitions(monitored_database_id)
+        if not definitions:
+            if progress:
+                progress("kpis", "No KPI definitions found; discovering KPIs.")
+            context = repository.current_schema_context(monitored_database_id)
+            if context is None:
+                repository.set_generation_status(monitored_database_id, "succeeded", analysis_run_id)
+                return 0
+            schema_revision_id, schema, summaries = context
+            candidates = KPIDiscoveryAgent().discover(schema, summaries)
+            saved = repository.save_candidates(monitored_database_id, schema_revision_id, candidates)
+            for candidate_id, _ in saved:
+                repository.approve(candidate_id, monitored_database_id)
+            definitions = repository.list_definitions(monitored_database_id)
+        elif progress:
+            progress("kpis", f"Refreshing {len(definitions)} existing KPI definitions.")
         for number, definition in enumerate(definitions, start=1):
             snapshot = KPIAggregateExecutor(connection_provider).execute(definition)
             repository.save_snapshot(snapshot)

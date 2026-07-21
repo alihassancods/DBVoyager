@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 from functools import lru_cache
+from collections.abc import Callable
 from typing import Any
 
 from fastapi import Request, Response, status
@@ -35,6 +36,12 @@ def _key(connection_id: str, resource: str) -> str:
 
 def _preview_key(connection_id: str, run_id: str) -> str:
     return f"dbv:v1:preview:{connection_id}:{run_id}"
+
+
+def cache_resource(prefix: str, value: Any) -> str:
+    """Return a stable, non-sensitive cache resource name for an input value."""
+    encoded = json.dumps(value, default=str, sort_keys=True, separators=(",", ":")).encode()
+    return f"{prefix}:{hashlib.sha256(encoded).hexdigest()}"
 
 
 def publish_preview(connection_id: str, run_id: str, collection_kind: str, report: Any) -> bool:
@@ -74,18 +81,48 @@ def warm_json(connection_id: str, resource: str, payload: Any) -> None:
         return
 
 
+def cached_value(
+    connection_id: str, resource: str, build: Callable[[], Any], ttl_seconds: int
+) -> Any:
+    """Return a cached JSON value, computing it only on a cache miss."""
+    client = _client()
+    key = _key(connection_id, resource)
+    if client is not None:
+        try:
+            body = client.hgetall(key).get(b"body")
+            if body:
+                return json.loads(body)
+        except Exception:
+            pass
+
+    value = build()
+    if client is not None:
+        try:
+            client.hset(key, mapping={"body": json.dumps(value, default=str, separators=(",", ":")).encode()})
+            client.expire(key, ttl_seconds)
+        except Exception:
+            pass
+    return value
+
+
 def invalidate(connection_id: str, *resources: str) -> None:
     client = _client()
     if client is None:
         return
     try:
-        client.unlink(*[_key(connection_id, resource) for resource in resources])
+        keys = [
+            key
+            for resource in resources
+            for key in client.scan_iter(match=f"{_key(connection_id, resource)}*")
+        ]
+        if keys:
+            client.unlink(*keys)
     except Exception:
         return
 
 
-def cached_json(request: Request, connection_id: str, resource: str, payload: Any) -> Response:
-    """Return JSON bytes from Redis when available; ownership is checked by the route first."""
+def cached_json(request: Request, connection_id: str, resource: str, build: Callable[[], Any]) -> Response:
+    """Return cached JSON before building an owner-checked dashboard payload."""
     client = _client()
     key = _key(connection_id, resource)
     body: bytes | None = None
@@ -104,6 +141,7 @@ def cached_json(request: Request, connection_id: str, resource: str, payload: An
             body = None
 
     if body is None:
+        payload = build()
         body = json.dumps(payload, default=str, separators=(",", ":")).encode()
         etag = hashlib.sha256(body).hexdigest()
         cache_state = "MISS" if client is not None else "BYPASS"

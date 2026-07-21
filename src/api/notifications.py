@@ -227,8 +227,11 @@ async def notification_socket(websocket: WebSocket) -> None:
     try:
         await hub.deliver(subject, claim_id, websocket)
         while True:
-            if (await websocket.receive())["type"] == "websocket.disconnect":
+            message = await websocket.receive()
+            if message["type"] == "websocket.disconnect":
                 break
+            if message.get("text") == '{"type":"ping"}':
+                await websocket.send_json({"type": "pong"})
     except WebSocketDisconnect:
         pass
     finally:

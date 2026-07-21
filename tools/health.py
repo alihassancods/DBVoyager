@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import os
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import Any
 
 from src.db_engine.connection import get_connection
@@ -168,6 +168,10 @@ def _finding(
         result["action"] = action
 
     return result
+
+
+def _row(value: Any, names: tuple[str, ...]) -> dict[str, Any]:
+    return dict(value) if isinstance(value, Mapping) else dict(zip(names, value))
 
 
 def _snapshot_findings(snapshot: StatisticsSnapshot, schema: DatabaseSchema | None) -> list[dict[str, str]]:

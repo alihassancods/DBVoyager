@@ -14,6 +14,7 @@ from src.agent.business_intelligence.orchestrator import BusinessIntelligenceOrc
 
 from .analysis_repository import _app_connection, ensure_owned_database
 from .auth import current_user
+from .resource_cache import cache_resource, cached_value
 from .store import connection_provider, get_connection
 
 
@@ -46,6 +47,10 @@ def _report_payload(
 
     return {
         "report_id": report_id,
+        "question": question,
+        "result": result,
+        "insight": insight,
+        "charts": charts,
         "notification": {
             "subject": subject,
             "action_label": "View Detail",
@@ -101,6 +106,14 @@ def _save_report(connection_id: str, result: dict[str, Any]) -> dict[str, Any]:
     return _report_payload(report_id, result["question"], plan, payload, insight, charts)
 
 
+def _cacheable_investigation(result: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: [item.model_dump() if hasattr(item, "model_dump") else item for item in value]
+        if isinstance(value, list) else value.model_dump() if hasattr(value, "model_dump") else value
+        for key, value in result.items()
+    }
+
+
 def _sse(event: str, data: dict[str, Any]) -> str:
     return f"event: {event}\ndata: {json.dumps(data, default=str)}\n\n"
 
@@ -115,9 +128,14 @@ def investigate_business_question(
     ensure_owned_database(connection_id, owner)
     get_connection(connection_id, owner)
     try:
-        result = BusinessIntelligenceOrchestrator(
-            connection_provider=connection_provider(connection_id, owner)
-        ).investigate(question=request.question)
+        result = cached_value(
+            connection_id,
+            cache_resource("bi", request.question),
+            lambda: _cacheable_investigation(BusinessIntelligenceOrchestrator(
+                connection_provider=connection_provider(connection_id, owner)
+            ).investigate(question=request.question)),
+            3600,
+        )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:

@@ -24,9 +24,17 @@ from .health_router import router as health_router
 from .kpis import router as kpis_router
 from .management import router as management_router
 from .notifications import notification_listener, router as notifications_router
+from .optimizer import router as optimizer_router
 from .analysis_repository import claim_due_collection_runs, run_scheduled_collection
 from .persistence_worker import process_persistence_jobs
 from .query_generator import router as query_generator_router
+
+
+def _interval_seconds(name: str, default: int) -> int:
+    try:
+        return max(1, int(os.getenv(name, str(default))))
+    except ValueError:
+        return default
 
 
 @asynccontextmanager
@@ -66,8 +74,7 @@ async def lifespan(_app: FastAPI):
 
     # Automated Business Intelligence (BI) Loop
     async def bi_agent_worker() -> None:
-        # Set interval as needed (e.g., 1800s = 30 minutes)
-        BI_INTERVAL_SECONDS = 1800
+        interval_seconds = _interval_seconds("DBVOYAGER_AGENT_INTERVAL_SECONDS", 1800)
         orchestrator = BusinessIntelligenceOrchestrator(
             connection_provider=lambda: get_connection()
         )
@@ -78,12 +85,13 @@ async def lifespan(_app: FastAPI):
                 await asyncio.to_thread(orchestrator.investigate, question=question)
             except Exception:
                 pass
-            await asyncio.sleep(BI_INTERVAL_SECONDS)
+            await asyncio.sleep(interval_seconds)
 
     # Initialize task references
     task = asyncio.create_task(scheduled_worker())
     persistence_task = asyncio.create_task(persistence_worker())
     notifications_task = asyncio.create_task(notification_listener())
+    bi_agent_task = asyncio.create_task(bi_agent_worker())
     try:
         yield
     finally:
@@ -91,7 +99,8 @@ async def lifespan(_app: FastAPI):
         task.cancel()
         persistence_task.cancel()
         notifications_task.cancel()
-        await asyncio.gather(task, persistence_task, notifications_task, return_exceptions=True)
+        bi_agent_task.cancel()
+        await asyncio.gather(task, persistence_task, notifications_task, bi_agent_task, return_exceptions=True)
 
 app = FastAPI(
     title="DBVoyager API",
@@ -138,3 +147,4 @@ app.include_router(auth_router)
 app.include_router(business_router)
 app.include_router(management_router)
 app.include_router(notifications_router)
+app.include_router(query_generator_router)

@@ -4,11 +4,18 @@ from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from src.api.auth import current_user
-from src.api.main import app
+from src.api.main import _interval_seconds, app
 from src.api.store import _connection_owners, _connections, _credentials, _reports, get_connection, register_connection
 
 
 client = TestClient(app)
+
+
+def test_agent_interval_uses_env_and_rejects_invalid_values(monkeypatch) -> None:
+    monkeypatch.setenv("DBVOYAGER_AGENT_INTERVAL_SECONDS", "1800")
+    assert _interval_seconds("DBVOYAGER_AGENT_INTERVAL_SECONDS", 60) == 1800
+    monkeypatch.setenv("DBVOYAGER_AGENT_INTERVAL_SECONDS", "invalid")
+    assert _interval_seconds("DBVOYAGER_AGENT_INTERVAL_SECONDS", 60) == 60
 
 
 def test_connection_cache_miss_reloads_encrypted_credentials() -> None:
@@ -124,7 +131,7 @@ def test_dashboard_refresh_persists_and_reads_the_latest_report() -> None:
 def test_overview_is_collecting_before_the_first_report_exists() -> None:
     app.dependency_overrides[current_user] = lambda: {"sub": "owner"}
     try:
-        with patch("src.api.dashboard.get_dashboard_summary", return_value=None), patch(
+        with patch("src.api.dashboard.ensure_owned_database"), patch("src.api.dashboard.get_dashboard_summary", return_value=None), patch(
             "src.api.dashboard.get_latest_collection_report", side_effect=HTTPException(status_code=404)
         ), patch("src.api.dashboard.get_latest_report", side_effect=HTTPException(status_code=404)):
             response = client.get("/connections/connection-1/overview")
@@ -146,15 +153,11 @@ def test_dashboard_refresh_stream_emits_progress_and_compact_completion() -> Non
     register_connection("connection-1", "owner", connection, {"database": "demo"})
     app.dependency_overrides[current_user] = lambda: {"sub": "owner"}
     try:
-        def collect(
-            _run_id: str,
-            _connection_id: str,
-            _database: str,
-            _provider: object,
-            progress: object,
-        ) -> dict[str, object]:
+        def collect(*_args: object) -> dict[str, object]:
+            progress, section_ready = _args[4], _args[6]
             progress("statistics", "started")
             progress("statistics", "completed")
+            section_ready("statistics", report["statistics"])
             return report
 
         with patch("src.api.dashboard.ensure_owned_database"), patch(
@@ -169,7 +172,9 @@ def test_dashboard_refresh_stream_emits_progress_and_compact_completion() -> Non
 
     assert response.headers["content-type"].startswith("text/event-stream")
     assert 'event: progress\ndata: {"stage": "statistics", "status": "started"}' in events
-    assert 'event: data_ready\ndata: {"analysis_run_id": "run-1"' in events
+    assert 'event: section_ready\ndata: {"section": "statistics", "data": {"status": "ok", "data": {}}}' in events
+    assert 'event: complete\ndata: {"analysis_run_id": "run-1", "status": "succeeded"}' in events
+    assert "event: data_ready" not in events
 
 
 def test_analysis_run_stream_emits_terminal_report() -> None:

@@ -53,3 +53,16 @@ def update_settings(
                               DO UPDATE SET settings = EXCLUDED.settings, updated_at = now()""",
                            (connection_id, Json(payload)))
     return {"data": payload}
+
+
+@router.get("/agent-reports/{report_id}")
+def agent_report(connection_id: str, report_id: str, user: dict[str, object] = Depends(current_user)) -> dict[str, Any]:
+    ensure_owned_database(connection_id, _owner(user))
+    with _app_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("""SELECT id, agent_kind, title, severity, report_json, created_at
+                              FROM agent_reports WHERE id = %s AND monitored_database_id = %s""", (report_id, connection_id))
+            row = cursor.fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Agent report not found")
+    return {"report_id": str(row[0]), "agent_kind": row[1], "title": row[2], "severity": row[3], "report": row[4], "created_at": row[5]}

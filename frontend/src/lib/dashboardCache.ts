@@ -1,5 +1,6 @@
 const prefix = 'dbvoyager:dashboard:';
 const maxEntries = 20;
+const memory = new Map<string, DashboardCacheEntry>();
 
 export type DashboardCacheEntry = {
   payload: Record<string, unknown>;
@@ -16,9 +17,13 @@ export function dashboardCacheKey(connectionId: string, resource: string): strin
 }
 
 export function readDashboardCache(key: string): DashboardCacheEntry | null {
+  const cached = memory.get(key);
+  if (cached) return cached;
   try {
     const value = sessionStorage.getItem(key);
-    return value ? JSON.parse(value) as DashboardCacheEntry : null;
+    const entry = value ? JSON.parse(value) as DashboardCacheEntry : null;
+    if (entry) memory.set(key, entry);
+    return entry;
   } catch {
     sessionStorage.removeItem(key);
     return null;
@@ -26,6 +31,7 @@ export function readDashboardCache(key: string): DashboardCacheEntry | null {
 }
 
 export function writeDashboardCache(key: string, entry: DashboardCacheEntry): void {
+  memory.set(key, entry);
   try {
     const existing = keys().filter(candidate => candidate !== key).map(candidate => ({
       key: candidate,
@@ -40,9 +46,12 @@ export function writeDashboardCache(key: string, entry: DashboardCacheEntry): vo
 
 export function invalidateDashboardConnection(connectionId: string, resources?: string[]): void {
   const match = `${prefix}${connectionId}:`;
-  for (const key of keys()) if (key.startsWith(match) && (!resources || resources.some(resource => key.endsWith(`:${resource}`)))) sessionStorage.removeItem(key);
+  for (const key of new Set([...keys(), ...memory.keys()])) if (key.startsWith(match) && (!resources || resources.some(resource => key.endsWith(`:${resource}`)))) {
+    memory.delete(key); sessionStorage.removeItem(key);
+  }
 }
 
 export function clearDashboardCache(): void {
+  memory.clear();
   for (const key of keys()) sessionStorage.removeItem(key);
 }

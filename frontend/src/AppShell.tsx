@@ -7,9 +7,11 @@ const nav = [
   ['dns', 'Connections', '/connections'],
   ['chat_bubble', 'BI Navigator', '/bi-chat'],
   ['query_stats', 'Query Optimizer', '/optimizer'],
+  ['code', 'Query Planner', '/query-planner'],
   ['table_chart', 'Schema Explorer', '/schema-explorer'],
   ['auto_graph', 'Health Checks', '/health-checks'],
   ['analytics', 'KPI Control Center', '/kpis'],
+  ['history', 'Analysis Logs', '/analysis-logs'],
 ] as const;
 
 const icon = (name: string) => <span aria-hidden="true" className="material-symbols-outlined">{name}</span>;

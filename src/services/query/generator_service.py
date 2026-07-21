@@ -64,44 +64,6 @@ SQL:
                 "explanation": None,
             }
 
-    @staticmethod
-    def execute_query(connection_provider, sql_script: str, is_mutating: bool = False) -> dict[str, Any]:
-        """
-        Executes generated SQL queries against the database.
-        Returns results for SELECT queries or affected row counts for mutating queries.
-        """
-        if not sql_script:
-            raise ValueError("No SQL script provided to execute.")
-
-        conn = connection_provider()
-        try:
-            # Enable autocommit for non-transaction operations like CONCURRENTLY or VACUUM
-            conn.autocommit = True
-            
-            with conn.cursor() as cursor:
-                statements = [stmt.strip() for stmt in sql_script.split(";") if stmt.strip()]
-                
-                results = []
-                for stmt in statements:
-                    cursor.execute(stmt)
-                    
-                    # Fetch results if query returns rows (e.g., SELECT statements)
-                    if cursor.description:
-                        columns = [desc[0] for desc in cursor.description]
-                        rows = cursor.fetchall()
-                        results.append({"columns": columns, "rows": rows})
-
-            return {
-                "success": True,
-                "results": results,
-                "is_mutating": is_mutating,
-            }
-        except Exception as exc:
-            logger.error("Failed to execute query: %s", exc)
-            raise exc
-        finally:
-            conn.close()
-
     def _format_schema_for_prompt(self, schema_context: dict[str, Any]) -> str:
         """Formats tables and column data into a structured string for the LLM prompt."""
         tables_info = schema_context.get("tables", {})

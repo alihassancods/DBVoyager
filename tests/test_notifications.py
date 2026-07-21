@@ -36,3 +36,17 @@ def test_notification_socket_stops_after_disconnect_message() -> None:
     register.assert_awaited_once()
     deliver.assert_awaited_once()
     unregister.assert_awaited_once()
+
+
+def test_notification_socket_replies_to_heartbeat() -> None:
+    websocket = SimpleNamespace(
+        scope={"subprotocols": ["dbvoyager.jwt.header.payload.signature"]},
+        accept=AsyncMock(), send_json=AsyncMock(),
+        receive=AsyncMock(side_effect=[{"type": "websocket.receive", "text": '{"type":"ping"}'}, {"type": "websocket.disconnect"}]),
+    )
+    with patch("src.api.notifications.verify_neon_token", return_value={"sub": "user"}), \
+         patch.object(hub, "register", new=AsyncMock()), patch.object(hub, "deliver", new=AsyncMock()), \
+         patch.object(hub, "unregister", new=AsyncMock()):
+        asyncio.run(notification_socket(websocket))
+
+    websocket.send_json.assert_awaited_once_with({"type": "pong"})

@@ -7,6 +7,7 @@ from pydantic import BaseModel, Field
 from psycopg2.extras import Json
 
 from src.agent.business_intelligence.validator import SQLValidator
+from src.agent.query_optimizer.models import OptimizationResult
 from src.agent.query_optimizer.optimizer_agent import QueryOptimizerAgent
 from src.db_engine.inspectors.explain_plan_inspector import ExplainPlanInspector
 from src.db_engine.inspectors.schema_inspector import SchemaInspector
@@ -20,6 +21,7 @@ from .analysis_repository import (
     get_slow_query_detail,
 )
 from .auth import current_user
+from .resource_cache import cache_resource, cached_value
 from .store import connection_provider, get_connection
 
 
@@ -110,7 +112,13 @@ def optimize_query(
     validation = SQLValidator().validate(query)
     if not validation.is_valid:
         raise HTTPException(status_code=400, detail=f"Stored query is unsafe: {validation.reason}")
-    result = agent.optimize_query(query)
+    cached_result = cached_value(
+        connection_id,
+        cache_resource("optimization", query),
+        lambda: agent.optimize_query(query).model_dump(),
+        3600,
+    )
+    result = OptimizationResult.model_validate(cached_result)
     optimized_validation = SQLValidator().validate(result.optimized_query)
     if not optimized_validation.is_valid:
         raise HTTPException(status_code=422, detail=f"Optimizer returned unsafe SQL: {optimized_validation.reason}")

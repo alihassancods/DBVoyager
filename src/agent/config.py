@@ -1,6 +1,7 @@
 """Shared LLM configuration for DBVoyager agents."""
 
 import os
+from functools import cache
 
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
@@ -9,6 +10,7 @@ from langchain_openai import ChatOpenAI
 load_dotenv()
 
 
+@cache
 def create_deepseek_llm() -> ChatOpenAI:
     """Create the shared DeepSeek Flash chat model from environment settings."""
     api_key = os.getenv("DEEPSEEK_API_KEY")

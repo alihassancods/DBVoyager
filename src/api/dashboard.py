@@ -2,6 +2,8 @@
 
 import asyncio
 import json
+from datetime import datetime, timezone
+from queue import Empty, Queue
 from typing import Any, Literal
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request, Response, status
@@ -31,14 +33,18 @@ from .analysis_repository import (
     get_latest_report,
     get_latest_statistics,
     collect_analysis,
+    has_active_analysis,
+    list_analysis_runs,
+    list_analysis_run_events,
     persist_collected_analysis,
     run_analysis,
     run_analysis_in_background,
 )
 from .auth import current_user
 from .store import connection_provider, get_connection, get_database_name
-from .resource_cache import cached_json, invalidate
-from .resource_cache import publish_preview, read_preview
+from .resource_cache import cache_resource, cached_json, cached_value, invalidate
+from .resource_cache import publish_preview, read_preview, warm_json
+from .brief import collect_brief
 
 
 router = APIRouter(prefix="/connections/{connection_id}")
@@ -137,7 +143,12 @@ def propose_fix(
     ensure_owned_database(connection_id, owner)
 
     engine = HealthFixEngine()
-    return engine.generate_proposed_fix(payload.finding)
+    return cached_value(
+        connection_id,
+        cache_resource("fix", payload.finding),
+        lambda: engine.generate_proposed_fix(payload.finding),
+        3600,
+    )
 
 
 @router.post("/health-checks/apply-fix")
@@ -264,6 +275,34 @@ async def collection_run_stream(
     return await analysis_run_stream(connection_id, run_id, user)
 
 
+@router.get("/analysis/logs")
+def analysis_logs(
+    connection_id: str,
+    limit: int = Query(default=20, ge=1, le=100),
+    user: dict[str, object] = Depends(current_user),
+) -> dict[str, Any]:
+    return {"data": list_analysis_runs(connection_id, _owner_subject(user), limit)}
+
+
+@router.get("/analysis/logs/{run_id}")
+def analysis_log_detail(
+    connection_id: str,
+    run_id: str,
+    user: dict[str, object] = Depends(current_user),
+) -> dict[str, Any]:
+    return get_analysis_run(connection_id, run_id, _owner_subject(user))
+
+
+@router.get("/analysis/logs/{run_id}/events")
+def analysis_log_events(
+    connection_id: str,
+    run_id: str,
+    offset: int = Query(default=0, ge=0),
+    user: dict[str, object] = Depends(current_user),
+) -> dict[str, Any]:
+    return {"data": list_analysis_run_events(connection_id, run_id, _owner_subject(user), offset)}
+
+
 def _sse(event: str, data: dict[str, Any]) -> str:
     return f"event: {event}\ndata: {json.dumps(data, default=str)}\n\n"
 
@@ -277,24 +316,53 @@ async def refresh_dashboard_stream(
     provider = connection_provider(connection_id, str(user["sub"]))
 
     async def stream() -> Any:
+        # Step 1: Run brief analysis first (fast, 3-4 queries, completes in < 2s)
+        try:
+            brief_data = await asyncio.to_thread(
+                collect_brief, provider,
+                lambda stage, msg: _record_progress(run_id, stage, msg),
+            )
+            brief_payload = {"status": "ok", "data": brief_data}
+            yield _sse("section_ready", {"section": "brief", "data": brief_payload})
+            _warm_brief_cache(connection_id, brief_data)
+        except Exception as exc:
+            yield _sse("section_ready", {"section": "brief", "data": {"status": "error", "error": f"{type(exc).__name__}: {exc}"}})
+
+        # Step 2: Deep analysis with per-section streaming
+        ready_sections: Queue[tuple[str, dict[str, Any]]] = Queue()
         task = asyncio.create_task(asyncio.to_thread(
             collect_analysis, run_id, connection_id, database_name, provider,
-            lambda stage, state: _record_progress(run_id, stage, state),
+            lambda stage, state: _record_progress(run_id, stage, state), "dashboard",
+            lambda section, data: ready_sections.put((section, data)),
         ))
         offset = 0
         while not task.done():
             events, offset = await asyncio.to_thread(get_analysis_progress, run_id, offset)
             for event in events:
                 yield _sse("progress", {"stage": event["stage"], "status": event["message"]})
+            while True:
+                try:
+                    section, data = ready_sections.get_nowait()
+                except Empty:
+                    break
+                _warm_section_cache(connection_id, section, data)
+                yield _sse("section_ready", {"section": section, "data": data})
             await asyncio.sleep(0.1)
         events, offset = await asyncio.to_thread(get_analysis_progress, run_id, offset)
         for event in events:
             yield _sse("progress", {"stage": event["stage"], "status": event["message"]})
+        while True:
+            try:
+                section, data = ready_sections.get_nowait()
+            except Empty:
+                break
+            _warm_section_cache(connection_id, section, data)
+            yield _sse("section_ready", {"section": section, "data": data})
         try:
             report = task.result()
             if publish_preview(connection_id, run_id, "dashboard", report):
                 _record_progress(run_id, "data_ready", "Collected data is ready for the dashboard.")
-                yield _sse("data_ready", {"analysis_run_id": run_id, "preview": f"/connections/{connection_id}/collection-runs/{run_id}/preview"})
+                yield _sse("complete", {"analysis_run_id": run_id, "status": "succeeded"})
             else:
                 await asyncio.to_thread(persist_collected_analysis, run_id, connection_id, report, "dashboard")
                 yield _sse("complete", {"analysis_run_id": run_id, "status": "succeeded"})
@@ -302,6 +370,42 @@ async def refresh_dashboard_stream(
             yield _sse("error", {"error": f"{type(exc).__name__}: {exc}"})
 
     return StreamingResponse(stream(), media_type="text/event-stream", headers=SSE_HEADERS)
+
+
+def _warm_brief_cache(connection_id: str, brief_data: dict) -> None:
+    """Warm Redis cache from brief collection results so GET endpoints find data immediately."""
+    try:
+        insights = brief_data.get("insights", [])
+        overview = {
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "health_summary": {s: sum(1 for i in insights if i["severity"] == s) for s in ("critical", "warning", "info")},
+            "database_stats": brief_data.get("database_stats", {}),
+            "top_slow_queries": brief_data.get("queries", [])[:5],
+            "table_count": len(brief_data.get("tables", [])),
+            "insights": insights[:10],
+            "query_telemetry_available": brief_data.get("query_telemetry_available", False),
+        }
+        warm_json(connection_id, "overview", overview)
+    except Exception:
+        pass
+
+
+def _warm_section_cache(connection_id: str, section: str, data: dict) -> None:
+    """Warm per-section Redis cache as each section arrives via SSE."""
+    if data.get("status") != "ok" or not isinstance(data.get("data"), dict):
+        return
+    try:
+        inner = data["data"]
+        if section == "statistics":
+            warm_json(connection_id, "statistics", data)
+            if inner.get("query_stats"):
+                warm_json(connection_id, "slow-queries:20", {"status": "ok", "data": inner["query_stats"][:20]})
+        elif section == "schema":
+            warm_json(connection_id, "schema", data)
+        elif section == "health_checks":
+            warm_json(connection_id, "health-checks", {"status": "ok", "data": inner})
+    except Exception:
+        pass
 
 
 @router.get("/collection-runs/{run_id}/preview")
@@ -317,74 +421,48 @@ def collection_preview(connection_id: str, run_id: str, user: dict[str, object] 
 def dashboard(
     connection_id: str,
     user: dict[str, object] = Depends(current_user),
-) -> dict[str, Any]:
-    return _report(connection_id, user)
+) -> Any:
+    try:
+        return _report(connection_id, user)
+    except HTTPException as exc:
+        if exc.status_code != 404:
+            raise
+        return JSONResponse(status_code=status.HTTP_202_ACCEPTED, content={"status": "collecting", "message": "Dashboard report is being generated."})
 
 
 @router.get("/overview")
 def overview(connection_id: str, request: Request, user: dict[str, object] = Depends(current_user)) -> Any:
-    summary = get_dashboard_summary(connection_id, _owner_subject(user))
-    if summary:
-        payload, _ = summary
-        return cached_json(request, connection_id, "overview", payload)
-        
-    try:
-        brief = get_latest_collection_report(connection_id, _owner_subject(user), "brief")["brief"]["data"]
-        return {
-            "generated_at": None,
-            "health_summary": {severity: sum(item["severity"] == severity for item in brief["insights"]) for severity in ("critical", "warning", "info")},
-            "database_stats": brief["database_stats"],
-            "top_slow_queries": brief["queries"],
-            "table_count": len(brief["tables"]),
-            "insights": brief["insights"],
-            "query_telemetry_available": brief["query_telemetry_available"]
-        }
-    except HTTPException as exc:
-        if exc.status_code != 404:
-            raise
+    ensure_owned_database(connection_id, _owner_subject(user))
+
+    def build() -> dict[str, Any]:
+        summary = get_dashboard_summary(connection_id, _owner_subject(user))
+        if summary:
+            return summary[0]
+        try:
+            brief = get_latest_collection_report(connection_id, _owner_subject(user), "brief")["brief"]["data"]
+            return {"generated_at": None, "health_summary": {severity: sum(item["severity"] == severity for item in brief["insights"]) for severity in ("critical", "warning", "info")}, "database_stats": brief["database_stats"], "top_slow_queries": brief["queries"], "table_count": len(brief["tables"]), "insights": brief["insights"], "query_telemetry_available": brief["query_telemetry_available"]}
+        except HTTPException as exc:
+            if exc.status_code != 404:
+                raise
+        report = _report(connection_id, user)
+        health, statistics = _section(report, "health_checks"), _section(report, "statistics")
+        findings = health.get("data", []) if health.get("status") == "ok" else []
+        stats = statistics.get("data", {}) if statistics.get("status") == "ok" else {}
+        health_score = HealthSummaryService.calculate_score(findings)
+        return {"generated_at": report.get("generated_at"), "health_summary": {severity: sum(item.get("severity") == severity for item in findings) for severity in ("critical", "warning", "info")}, "database_stats": stats.get("database_stats", {}), "top_slow_queries": stats.get("query_stats", [])[:5], "table_count": len(_section(report, "schema").get("data", {}).get("tables", [])), "health_score": health_score, "top_findings": HealthSummaryService.top_findings(findings), "summary": cached_value(connection_id, cache_resource("execsummary", {"score": health_score, "findings": findings[:10]}), lambda: ExecutiveSummaryAgent().summarize(health_score, findings), 600)}
 
     try:
-        report = _report(connection_id, user)
+        return cached_json(request, connection_id, "overview", build)
     except HTTPException as exc:
         if exc.status_code != 404:
             raise
         return JSONResponse(status_code=status.HTTP_202_ACCEPTED, content={"collection_status": "collecting"})
 
-    health = _section(report, "health_checks")
-    statistics = _section(report, "statistics")
-    findings = health.get("data", []) if health.get("status") == "ok" else []
-    stats = statistics.get("data", {}) if statistics.get("status") == "ok" else {}
-
-    # Calculate score & top findings
-    health_score = HealthSummaryService.calculate_score(findings)
-    top_findings = HealthSummaryService.top_findings(findings)
-
-    # Generate AI Executive Summary using your ExecutiveSummaryAgent
-    summary_agent = ExecutiveSummaryAgent()
-    executive_summary = summary_agent.summarize(
-        health_score=health_score,
-        findings=findings,
-    )
-
-    return {
-        "generated_at": report.get("generated_at"),
-        "health_summary": {
-            severity: sum(item.get("severity") == severity for item in findings)
-            for severity in ("critical", "warning", "info")
-        },
-        "database_stats": stats.get("database_stats", {}),
-        "top_slow_queries": stats.get("query_stats", [])[:5],
-        "table_count": len(_section(report, "schema").get("data", {}).get("tables", [])),
-        "health_score": health_score,
-        "top_findings": top_findings,
-        "summary": executive_summary,  # <--- Integrated AI Executive Summary
-    }
-
 
 @router.get("/insights")
 def insights(connection_id: str, request: Request, limit: int = Query(default=10, ge=1, le=50), user: dict[str, object] = Depends(current_user)) -> Response:
-    report = get_latest_collection_report(connection_id, _owner_subject(user), "brief")
-    return cached_json(request, connection_id, f"insights:{limit}", {"data": report["brief"]["data"]["insights"][:limit]})
+    ensure_owned_database(connection_id, _owner_subject(user))
+    return cached_json(request, connection_id, f"insights:{limit}", lambda: {"data": get_latest_collection_report(connection_id, _owner_subject(user), "brief")["brief"]["data"]["insights"][:limit]})
 
 
 @router.get("/health-checks")
@@ -395,27 +473,25 @@ def health_checks(
     check: str | None = Query(default=None),
     user: dict[str, object] = Depends(current_user),
 ) -> Response:
+    ensure_owned_database(connection_id, _owner_subject(user))
+    resource = "health-checks" if severity is None and check is None else f"health-checks:{severity or 'all'}:{check or 'all'}"
+    def build() -> dict[str, Any]:
+        try:
+            findings = get_latest_health_findings(connection_id, _owner_subject(user))
+        except HTTPException as exc:
+            if exc.status_code != 404:
+                raise
+            section = _section(_collection_report(connection_id, user, "health_checks"), "health_checks")
+            if section["status"] != "ok":
+                return section
+            findings = section["data"]
+        return {"status": "ok", "data": [finding for finding in findings if (severity is None or finding["severity"] == severity) and (check is None or finding["check"] == check)]}
     try:
-        findings = get_latest_health_findings(connection_id, _owner_subject(user))
+        return cached_json(request, connection_id, resource, build)
     except HTTPException as exc:
         if exc.status_code != 404:
             raise
-        try:
-            section = _section(_collection_report(connection_id, user, "health_checks"), "health_checks")
-        except HTTPException as missing:
-            if missing.status_code != 404:
-                raise
-            return JSONResponse(status_code=status.HTTP_202_ACCEPTED, content={"status": "collecting", "data": []})
-        if section["status"] != "ok":
-            return section
-        findings = section["data"]
-    data = [
-        finding for finding in findings
-        if (severity is None or finding["severity"] == severity)
-        and (check is None or finding["check"] == check)
-    ]
-    resource = "health-checks" if severity is None and check is None else f"health-checks:{severity or 'all'}:{check or 'all'}"
-    return cached_json(request, connection_id, resource, {"status": "ok", "data": data})
+        return JSONResponse(status_code=status.HTTP_202_ACCEPTED, content={"status": "collecting", "message": "Health check collection is in progress."})
 
 
 @router.patch("/health-checks/{finding_id}")
@@ -457,7 +533,7 @@ def statistics(
         except HTTPException as missing:
             if missing.status_code != 404:
                 raise
-            return {"status": "collecting", "data": {"query_stats": [], "table_stats": [], "index_stats": [], "lock_stats": [], "database_stats": {}}}
+            return {"status": "collecting", "message": "Statistics collection is in progress.", "data": {"query_stats": [], "table_stats": [], "index_stats": [], "lock_stats": [], "database_stats": {}}}
 
 
 def _statistics_group(connection_id: str, name: str, user: dict[str, object]) -> dict[str, Any]:
@@ -492,7 +568,8 @@ def slow_queries(
     limit: int = Query(default=20, ge=1, le=100),
     user: dict[str, object] = Depends(current_user),
 ) -> Response:
-    return cached_json(request, connection_id, f"slow-queries:{limit}", query_statistics(connection_id, "total_exec_time", limit, user))
+    ensure_owned_database(connection_id, _owner_subject(user))
+    return cached_json(request, connection_id, f"slow-queries:{limit}", lambda: query_statistics(connection_id, "total_exec_time", limit, user))
 
 
 @router.get("/statistics/tables")
@@ -539,7 +616,7 @@ def _schema_payload(
         except HTTPException as missing:
             if missing.status_code != 404:
                 raise
-            return {"status": "collecting", "data": {"tables": [], "columns": [], "primary_keys": [], "foreign_keys": [], "indexes": [], "relations": []}}
+            return {"status": "collecting", "message": "Schema collection is in progress.", "data": {"tables": [], "columns": [], "primary_keys": [], "foreign_keys": [], "indexes": [], "relations": []}}
 
 
 @router.get("/schema")
@@ -548,7 +625,8 @@ def schema(
     request: Request,
     user: dict[str, object] = Depends(current_user),
 ) -> Response:
-    return cached_json(request, connection_id, "schema", _schema_payload(connection_id, user))
+    ensure_owned_database(connection_id, _owner_subject(user))
+    return cached_json(request, connection_id, "schema", lambda: _schema_payload(connection_id, user))
 
 
 @router.get("/schema/diagram")
@@ -561,7 +639,7 @@ def schema_diagram(
     except HTTPException as exc:
         if exc.status_code != 404:
             raise
-        return {"status": "collecting", "data": ""}
+        return {"status": "collecting", "message": "Schema diagram is being generated."}
 
 
 @router.get("/schema/visualizer")
@@ -572,23 +650,25 @@ def schema_visualizer(
     offset: int = Query(default=0, ge=0),
     user: dict[str, object] = Depends(current_user),
 ) -> Response:
-    schema_data = _schema_payload(connection_id, user)["data"]
-    summaries: dict[tuple[str, str], str] = {}
-    from .analysis_repository import _app_connection
-    with _app_connection() as connection:
-        with connection.cursor() as cursor:
-            cursor.execute("""SELECT schema_name, table_name, business_summary FROM database_tables
-                              WHERE monitored_database_id = %s AND removed_at IS NULL AND summary_status = 'ready'""", (connection_id,))
-            summaries = {(row[0], row[1]): row[2] for row in cursor.fetchall()}
-    columns = schema_data.get("columns", [])
-    primary_keys = {(key["table_name"], key["column_name"]) for key in schema_data.get("primary_keys", [])}
-    foreign_keys = schema_data.get("foreign_keys", [])
-    all_tables = schema_data.get("tables", [])
-    tables = all_tables[offset:offset + limit]
-    table_names = {table["table_name"] for table in tables}
-    relationships = [key for key in foreign_keys if key["source_table"] in table_names or key["target_table"] in table_names]
-    indexes = schema_data.get("indexes", [])
-    return cached_json(request, connection_id, f"schema/visualizer:{limit}:{offset}", {"data": {"tables": [{"name": table["table_name"], "schema": table["schema_name"], "table_type": table["table_type"], "estimated_rows": table.get("estimated_rows"), "summary": summaries.get((table["schema_name"], table["table_name"])), "columns": [{**column, "primary_key": (table["table_name"], column["column_name"]) in primary_keys, "foreign_key": any(key["source_table"] == table["table_name"] and key["source_column"] == column["column_name"] for key in relationships)} for column in columns if column["table_name"] == table["table_name"]], "indexes": [index for index in indexes if index["table_name"] == table["table_name"]]} for table in tables], "relationships": relationships}, "next_offset": offset + limit if len(all_tables) > offset + limit else None})
+    ensure_owned_database(connection_id, _owner_subject(user))
+
+    def build() -> dict[str, Any]:
+        schema_data = _schema_payload(connection_id, user)["data"]
+        from .analysis_repository import _app_connection
+        with _app_connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute("""SELECT schema_name, table_name, business_summary FROM database_tables
+                                  WHERE monitored_database_id = %s AND removed_at IS NULL AND summary_status = 'ready'""", (connection_id,))
+                summaries = {(row[0], row[1]): row[2] for row in cursor.fetchall()}
+        columns = schema_data.get("columns", [])
+        primary_keys = {(key["table_name"], key["column_name"]) for key in schema_data.get("primary_keys", [])}
+        foreign_keys, all_tables, indexes = schema_data.get("foreign_keys", []), schema_data.get("tables", []), schema_data.get("indexes", [])
+        tables = all_tables[offset:offset + limit]
+        table_names = {table["table_name"] for table in tables}
+        relationships = [key for key in foreign_keys if key["source_table"] in table_names or key["target_table"] in table_names]
+        return {"data": {"tables": [{"name": table["table_name"], "schema": table["schema_name"], "table_type": table["table_type"], "estimated_rows": table.get("estimated_rows"), "summary": summaries.get((table["schema_name"], table["table_name"])), "columns": [{**column, "primary_key": (table["table_name"], column["column_name"]) in primary_keys, "foreign_key": any(key["source_table"] == table["table_name"] and key["source_column"] == column["column_name"] for key in relationships)} for column in columns if column["table_name"] == table["table_name"]], "indexes": [index for index in indexes if index["table_name"] == table["table_name"]]} for table in tables], "relationships": relationships}, "next_offset": offset + limit if len(all_tables) > offset + limit else None}
+
+    return cached_json(request, connection_id, f"schema/visualizer:{limit}:{offset}", build)
 
 
 def _owned_schema_table(connection_id: str, owner: str, schema_name: str, table_name: str) -> None:

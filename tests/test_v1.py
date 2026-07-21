@@ -63,9 +63,11 @@ def test_build_report_collects_statistics_and_schema_on_separate_connections(mon
     monkeypatch.setattr(v1, "SchemaInspector", SchemaInspector)
     monkeypatch.setattr(v1, "SchemaVisualizer", Visualizer)
 
-    report = v1.build_report("demo", provider, sections={"statistics", "schema"})
+    ready = []
+    report = v1.build_report("demo", provider, sections={"statistics", "schema"}, section_ready=lambda name, _data: ready.append(name))
 
     assert report["statistics"]["status"] == "ok"
     assert report["schema"]["status"] == "ok"
+    assert {"statistics", "schema", "schema_visualization"}.issubset(ready)
     assert len(connections) == 2
     assert all(connection.closed for connection in connections)

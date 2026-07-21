@@ -5,7 +5,7 @@ from fastapi.testclient import TestClient
 
 from src.agent.kpi.models import KPIDefinition
 from src.api.auth import current_user
-from src.api.kpis import _generate_and_invalidate, get_kpi_repository
+from src.api.kpis import _generate, get_kpi_repository
 from src.api.main import app
 from src.models.schema.column_model import ColumnInfo
 from src.models.schema.schema_model import DatabaseSchema
@@ -135,11 +135,10 @@ def test_kpi_generation_status_has_idle_default() -> None:
     assert response.json()["status"] == "idle"
 
 
-def test_generation_invalidates_dashboard_after_background_work() -> None:
+def test_generation_runs_in_background() -> None:
     provider = object()
 
-    with patch("src.api.kpis.generate_kpis") as generate, patch("src.api.kpis.invalidate") as invalidate:
-        _generate_and_invalidate("connection-1", provider)
+    with patch("src.api.kpis.generate_kpis") as generate:
+        _generate("connection-1", provider)
 
     generate.assert_called_once_with("connection-1", provider)
-    invalidate.assert_called_once_with("connection-1", "kpis/dashboard")

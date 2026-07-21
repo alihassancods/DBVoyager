@@ -171,12 +171,51 @@ def test_auto_kpis_discovers_and_calculates_without_review() -> None:
         assert generate_kpis("db-1", lambda: object()) == 1
 
 
+def test_auto_kpis_refreshes_existing_definitions_without_discovery() -> None:
+    definition = KPIDefinition(
+        id="kpi-1", monitored_database_id="db-1", schema_revision_id="schema-1",
+        table_name="orders", measure_column="total", aggregation="sum", title="Revenue",
+        rationale="Order totals", confidence=1,
+    )
+
+    class Repository:
+        def set_generation_status(self, *args, **kwargs):
+            pass
+
+        def list_definitions(self, connection_id):
+            assert connection_id == "db-1"
+            return [definition]
+
+        def save_snapshot(self, snapshot):
+            assert snapshot.kpi_definition_id == "kpi-1"
+
+    class Executor:
+        def __init__(self, _provider):
+            pass
+
+        def execute(self, received):
+            assert received == definition
+            return KPISnapshot(
+                kpi_definition_id="kpi-1", monitored_database_id="db-1", sql="SELECT 1", points=[], execution_ms=1
+            )
+
+    with patch("src.agent.kpi.auto.KPIRepository", return_value=Repository()), \
+         patch("src.agent.kpi.auto.KPIDiscoveryAgent") as discovery, \
+         patch("src.agent.kpi.auto.KPIAggregateExecutor", Executor):
+        assert generate_kpis("db-1", lambda: object()) == 1
+
+    discovery.assert_not_called()
+
+
 def test_auto_kpis_marks_discovery_service_unavailable() -> None:
     statuses = []
 
     class Repository:
         def set_generation_status(self, *args, **kwargs):
             statuses.append((args, kwargs))
+
+        def list_definitions(self, _connection_id):
+            return []
 
         def current_schema_context(self, _connection_id):
             return "schema-1", _schema(), {}
