@@ -1,6 +1,5 @@
 import { useState, type FormEvent } from 'react';
 import { useNavigate } from 'react-router-dom';
-import officialLogo from '../../../../sample/stitch/stitch_dbvoyager_platform_ui/dbvoyager_logo_icon/screen.png';
 import { authenticate } from '../lib/auth';
 
 const passwordMessage = 'Use 8+ characters with uppercase, lowercase, and a number.';
@@ -48,12 +47,12 @@ export default function AuthPage({ signup }: { signup: boolean }) {
 
   return <main className="auth-page grid min-h-screen bg-voyager-navy text-voyager-text-primary md:grid-cols-[1.2fr_.8fr]">
     <section className="stitch-grid relative hidden overflow-hidden p-10 md:flex md:flex-col md:justify-between">
-      <a href="/" className="relative z-10 flex items-center gap-3 font-display text-xl font-bold"><img src={officialLogo} alt="DBVoyager logo" className="size-12 rounded-xl" />DBVoyager</a>
+      <a href="/" className="relative z-10 flex items-center gap-3 font-display text-xl font-bold"><img src="/screen.png" alt="DBVoyager logo" className="size-12 rounded-xl" />DBVoyager</a>
       <div className="relative z-10 max-w-xl"><p className="font-mono text-xs uppercase tracking-[.2em] text-voyager-blue">Autonomous agentic DBA AI</p><h1 className="mt-5 font-display text-5xl font-bold leading-tight">Your database gets a <span className="text-voyager-blue">second set of eyes.</span></h1><p className="mt-5 max-w-lg text-lg leading-8 text-voyager-text-secondary">DBVoyager watches PostgreSQL, investigates what changed, and prepares safe recommendations for your approval.</p></div>
       <div className="relative z-10 flex gap-3 text-sm text-voyager-text-secondary"><span className="voyager-card px-3 py-2">◉ Observe</span><span className="voyager-card px-3 py-2">✦ Investigate</span><span className="voyager-card px-3 py-2">✓ Recommend</span></div>
     </section>
     <section className="flex items-center justify-center p-6 sm:p-10"><div className="w-full max-w-md">
-      <a href="/" className="mb-12 flex items-center gap-2 font-display text-lg font-bold md:hidden"><img src={officialLogo} alt="DBVoyager logo" className="size-9 rounded-lg" />DBVoyager</a>
+      <a href="/" className="mb-12 flex items-center gap-2 font-display text-lg font-bold md:hidden"><img src="/screen.png" alt="DBVoyager logo" className="size-9 rounded-lg" />DBVoyager</a>
       <p className="font-mono text-xs uppercase tracking-[.2em] text-voyager-blue">{signup ? 'Deploy your DBA AI' : 'Welcome back'}</p>
       <h2 className="mt-3 font-display text-3xl font-bold">{signup ? 'Give your database a second set of eyes.' : 'Return to your DBA AI workspace.'}</h2>
       <p className="mt-3 text-voyager-text-secondary">{signup ? 'Create your account, then connect PostgreSQL to surface the signals that matter.' : 'Your database operations are waiting.'}</p>

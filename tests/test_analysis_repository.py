@@ -81,6 +81,50 @@ def test_health_findings_are_saved_in_one_batch(monkeypatch) -> None:
     ]]
 
 
+def test_health_collection_fails_when_health_checks_fail(monkeypatch) -> None:
+    class Cursor:
+        def __init__(self) -> None:
+            self.calls = []
+
+        def execute(self, query, params=None) -> None:
+            self.calls.append((query, params))
+
+    class Connection:
+        def __init__(self) -> None:
+            self.cursor_instance = Cursor()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args) -> None:
+            return None
+
+        def cursor(self):
+            class CursorContext:
+                def __enter__(_self):
+                    return self.cursor_instance
+
+                def __exit__(_self, *_args) -> None:
+                    return None
+
+            return CursorContext()
+
+    connection = Connection()
+    monkeypatch.setattr(analysis_repository, "_app_connection", lambda: connection)
+    monkeypatch.setattr(analysis_repository, "_persist_schema", lambda *_args: "schema-1")
+    monkeypatch.setattr(analysis_repository, "_persist_statistics", lambda *_args: None)
+    monkeypatch.setattr(analysis_repository, "invalidate", lambda *_args: None)
+
+    analysis_repository._persist_report("run-1", "connection-1", {
+        "statistics": {"status": "ok", "data": {}},
+        "schema": {"status": "ok", "data": {}},
+        "health_checks": {"status": "error", "error": "broken"},
+    }, collection_kind="health_checks")
+
+    assert connection.cursor_instance.calls[-1][1][0] == "failed"
+    assert connection.cursor_instance.calls[-1][1][-3] == "collection_incomplete"
+
+
 def test_table_stat_batch_matches_its_insert_template(monkeypatch) -> None:
     batches = []
 

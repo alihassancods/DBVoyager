@@ -170,10 +170,6 @@ def _finding(
     return result
 
 
-def _row(value: Any, names: tuple[str, ...]) -> dict[str, Any]:
-    return dict(value) if isinstance(value, Mapping) else dict(zip(names, value))
-
-
 def _snapshot_findings(snapshot: StatisticsSnapshot, schema: DatabaseSchema | None) -> list[dict[str, str]]:
     findings: list[dict[str, str]] = []
     database = snapshot.database_stats
@@ -250,29 +246,33 @@ def _snapshot_findings(snapshot: StatisticsSnapshot, schema: DatabaseSchema | No
     return findings
 
 
+def _to_row(raw: Any, names: tuple[str, ...]) -> dict[str, Any]:
+    """Convert a database row (tuple or Mapping) to a dict by column name."""
+    return dict(raw) if isinstance(raw, Mapping) else dict(zip(names, raw))
+
 def _sql_findings(cursor: Any) -> list[dict[str, str]]:
     findings: list[dict[str, str]] = []
     cursor.execute(LONG_TRANSACTIONS_SQL)
     for raw in cursor.fetchall():
-        row = _row(raw, ("pid", "usename", "duration", "state"))
+        row = _to_row(raw, ("pid", "usename", "duration", "state"))
         findings.append(_finding("long_transactions", "warning", f"Session {row['pid']} ({row['usename']}) has been in a transaction for {row['duration']}.", "Commit or roll back promptly."))
     cursor.execute(BLOCKING_SQL)
     for raw in cursor.fetchall():
-        row = _row(raw, ("blocked_pid", "blocking_pid", "wait_duration"))
+        row = _to_row(raw, ("blocked_pid", "blocking_pid", "wait_duration"))
         findings.append(_finding("blocking", "critical", f"Session {row['blocking_pid']} blocks {row['blocked_pid']} for {row['wait_duration']}.", "Inspect the blocker before cancelling work."))
     cursor.execute(AUTOVACUUM_SQL)
     for raw in cursor.fetchall():
-        row = _row(raw, ("relname", "n_dead_tup", "last_autovacuum", "last_autoanalyze"))
+        row = _to_row(raw, ("relname", "n_dead_tup", "last_autovacuum", "last_autoanalyze"))
         findings.append(_finding("autovacuum_analyze", "warning", f"{row['relname']} has {int(row['n_dead_tup']):,} dead tuples; autovacuum: {row['last_autovacuum']}, autoanalyze: {row['last_autoanalyze']}.", "Run VACUUM (ANALYZE) and tune autovacuum if this persists."))
     cursor.execute(CONNECTION_SQL)
     raw = cursor.fetchone()
     if raw is not None:
-        row = _row(raw, ("current_connections", "max_connections"))
+        row = _to_row(raw, ("current_connections", "max_connections"))
         ratio = int(row["current_connections"]) / int(row["max_connections"])
         if ratio >= 0.8:
             findings.append(_finding("connections", "critical" if ratio >= 0.9 else "warning", f"{row['current_connections']} of {row['max_connections']} connections are in use ({ratio:.0%}).", "Investigate leaks or use a connection pooler."))
     cursor.execute(SETTINGS_SQL)
-    settings = {str(row["name"]): str(row["setting"]) for raw in cursor.fetchall() for row in [_row(raw, ("name", "setting", "unit"))]}
+    settings = {str(row["name"]): str(row["setting"]) for raw in cursor.fetchall() for row in [_to_row(raw, ("name", "setting", "unit"))]}
     findings.append(_finding("memory_configuration", "info", "Memory settings: " + ", ".join(f"{name}={settings.get(name, 'unavailable')}" for name in ("shared_buffers", "work_mem", "effective_cache_size"))))
     findings.append(_finding(
         "server_resources", "info",
@@ -302,39 +302,39 @@ def _sql_findings(cursor: Any) -> list[dict[str, str]]:
     )
     raw = cursor.fetchone()
     if raw is not None:
-        row = _row(raw, ("checkpoints_timed", "checkpoints_req", "buffers_checkpoint"))
+        row = _to_row(raw, ("checkpoints_timed", "checkpoints_req", "buffers_checkpoint"))
         total = int(row["checkpoints_timed"]) + int(row["checkpoints_req"])
         if total and int(row["checkpoints_req"]) / total > 0.3:
             findings.append(_finding("wal_checkpoints", "warning", f"{int(row['checkpoints_req']) / total:.0%} of checkpoints were requested.", "Review max_wal_size and checkpoint_completion_target."))
     cursor.execute(WAL_GENERATION_SQL)
     raw = cursor.fetchone()
     if raw is not None:
-        row = _row(raw, ("wal_bytes",))
+        row = _to_row(raw, ("wal_bytes",))
         findings.append(_finding("wal_generation", "info", f"WAL written since the statistics reset: {int(row['wal_bytes']):,} bytes.", "Compare periodic result.txt reports to identify unexpected WAL growth."))
     cursor.execute(DEADLOCKS_SQL)
     raw = cursor.fetchone()
     if raw is not None:
-        row = _row(raw, ("deadlocks",))
+        row = _to_row(raw, ("deadlocks",))
         if int(row["deadlocks"]):
             findings.append(_finding("deadlocks", "warning", f"{row['deadlocks']} deadlocks have occurred since the statistics reset.", "Review application lock ordering and transaction scope."))
     cursor.execute(REPLICATION_SQL)
     for raw in cursor.fetchall():
-        row = _row(raw, ("application_name", "state", "replay_lag_seconds"))
+        row = _to_row(raw, ("application_name", "state", "replay_lag_seconds"))
         if int(row["replay_lag_seconds"]) > 60:
             findings.append(_finding("replication", "critical" if int(row["replay_lag_seconds"]) > 300 else "warning", f"Replica {row['application_name']} is {row['replay_lag_seconds']} seconds behind ({row['state']}).", "Check replica resources, network, and WAL retention."))
     cursor.execute(ARCHIVER_SQL)
     raw = cursor.fetchone()
     if raw is not None:
-        row = _row(raw, ("archived_count", "failed_count", "last_archived_time", "last_failed_time"))
+        row = _to_row(raw, ("archived_count", "failed_count", "last_archived_time", "last_failed_time"))
         findings.append(_finding("backups", "info", f"WAL archive count is {row['archived_count']}; last archive: {row['last_archived_time']}.", "Run and restore-test a real backup; PostgreSQL cannot verify backup validity."))
         if int(row["failed_count"]):
             findings.append(_finding("backups_wal_archive", "critical", f"WAL archiving has failed {row['failed_count']} times; last failure: {row['last_failed_time']}.", "Fix archive_command and verify a restorable backup separately."))
     cursor.execute(PGSTATTUPLE_SQL)
     raw = cursor.fetchone()
-    if raw and _row(raw, ("enabled",))["enabled"]:
+    if raw and _to_row(raw, ("enabled",))["enabled"]:
         cursor.execute(INDEX_BLOAT_SQL)
         for raw in cursor.fetchall():
-            row = _row(raw, ("index_name", "leaf_density"))
+            row = _to_row(raw, ("index_name", "leaf_density"))
             if float(row["leaf_density"]) < 50:
                 findings.append(_finding("index_bloat", "warning", f"{row['index_name']} has {float(row['leaf_density']):.0f}% leaf density.", "Consider REINDEX after confirming index bloat."))
     else:
@@ -353,6 +353,8 @@ def audit_connection(connection: Any, statistics_snapshot: StatisticsSnapshot, s
              )
              + _sql_findings(cursor)
     )
+        if not findings:
+            findings.append(_finding("health_check_completed", "info", "No health issues were detected.", "Continue monitoring this database."))
 
         findings.sort(
             key=lambda x: x["impact_score"],

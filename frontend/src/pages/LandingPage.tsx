@@ -1,5 +1,4 @@
 import { useEffect, useRef, useState } from 'react';
-import officialLogo from '../../../../sample/stitch/stitch_dbvoyager_platform_ui/dbvoyager_logo_icon/screen.png';
 import { isAuthenticated, logout } from '../lib/auth';
 
 const apiUrl = import.meta.env.VITE_API_URL || 'http://localhost:8000';
@@ -11,7 +10,7 @@ const pages = [
 ] as const;
 
 function Logo() {
-  return <a href="/" className="flex items-center gap-2 font-display text-lg font-bold"><img src={officialLogo} alt="DBVoyager logo" className="size-9 rounded-lg" />DBVoyager</a>;
+  return <a href="/" className="flex items-center gap-2 font-display text-lg font-bold"><img src="/screen.png" alt="DBVoyager logo" className="size-9 rounded-lg" />DBVoyager</a>;
 }
 
 function InteractiveDots() {

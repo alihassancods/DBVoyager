@@ -24,7 +24,7 @@ from src.models.business_intelligence.investigation_plan import InvestigationPla
 from src.models.business_intelligence.sql_result import SQLResult
 from .brief import collect_brief
 from .resource_cache import invalidate, publish_preview, warm_json
-from v1 import build_report
+from tools.v1 import build_report
 
 
 ConnectionProvider = Callable[[], Any]
@@ -543,6 +543,7 @@ def get_latest_health_findings(connection_id: str, auth_subject: str) -> list[di
                 WHERE finding.run_id = (
                     SELECT latest.id FROM analysis_runs latest
                     WHERE latest.monitored_database_id = %s AND latest.status = 'succeeded'
+                      AND EXISTS (SELECT 1 FROM health_findings hf WHERE hf.run_id = latest.id)
                     ORDER BY latest.finished_at DESC LIMIT 1
                 ) AND users.auth_subject = %s
                 ORDER BY CASE finding.severity WHEN 'critical' THEN 0 WHEN 'warning' THEN 1 ELSE 2 END, finding.created_at
@@ -891,9 +892,9 @@ def _persist_report(
     health_checks = _ok_data(report, "health_checks")
     generated_at = report.get("generated_at") or datetime.now(UTC).isoformat()
     complete = (
-        statistics is not None and schema is not None
-        if collection_kind in {"dashboard", "health_checks"}
-        else (statistics is not None if collection_kind in {"statistics", "slow_queries"} else schema is not None)
+        statistics is not None and schema is not None and health_checks is not None
+        if collection_kind == "health_checks"
+        else (statistics is not None and schema is not None if collection_kind == "dashboard" else statistics is not None if collection_kind in {"statistics", "slow_queries"} else schema is not None)
     )
 
     with _app_connection() as connection:
@@ -932,7 +933,7 @@ def _persist_report(
                     schema_revision_id,
                     _fingerprint(schema) if schema is not None else None,
                     None if complete else "collection_incomplete",
-                    None if complete else "Statistics and schema collection must both succeed",
+                    None if complete else "Statistics, schema, and health checks must all succeed" if collection_kind == "health_checks" else "Statistics and schema collection must both succeed",
                     run_id,
                 ),
             )

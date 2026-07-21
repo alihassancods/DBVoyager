@@ -25,6 +25,27 @@ def _app_connection() -> Any:
     return psycopg2.connect(database_url, connect_timeout=10)
 
 
+_TRANSIENT_ERRORS = (psycopg2.OperationalError, psycopg2.InterfaceError)
+
+
+def _db_op(max_retries: int = 1) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    """Decorator: retry a database operation on transient psycopg2 errors."""
+    def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            last_error: Exception | None = None
+            for attempt in range(max_retries + 1):
+                try:
+                    return func(*args, **kwargs)
+                except _TRANSIENT_ERRORS as exc:
+                    last_error = exc
+                    if attempt < max_retries:
+                        continue
+                    raise
+            raise last_error  # type: ignore[misc]  # never reached, keeps mypy happy
+        return wrapper
+    return decorator
+
+
 class KPIRepository:
     def __init__(self, connection_factory: Callable[[], Any] = _app_connection) -> None:
         self._connection_factory = connection_factory
@@ -328,6 +349,7 @@ class KPIRepository:
             "generated_at": row[5],
         }
 
+    @_db_op()
     def latest_snapshot(
         self, definition_id: str, monitored_database_id: str | None = None
     ) -> dict[str, Any] | None:
@@ -353,6 +375,7 @@ class KPIRepository:
             return None
         return self._snapshot_payload(row)
 
+    @_db_op()
     def latest_snapshots(self, monitored_database_id: str) -> dict[str, dict[str, Any]]:
         """Fetch the newest successful snapshot for every KPI of one database."""
         with self._connection_factory() as connection:

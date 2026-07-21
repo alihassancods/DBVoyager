@@ -5,7 +5,7 @@ export type DashboardSection = 'overview' | 'statistics' | 'health-checks' | 'sc
 export type JsonRecord = Record<string, unknown>;
 
 const pathFor = (section: DashboardSection) => section === 'optimizer' ? 'optimizer/slow-queries' : section === 'kpis' ? 'kpis/dashboard' : section;
-const maxAgeMs = 30_000;
+const maxAgeMs = 5 * 60_000;
 const asRecord = (value: unknown): JsonRecord => value && typeof value === 'object' && !Array.isArray(value) ? value as JsonRecord : {};
 const asRows = (value: unknown): JsonRecord[] => Array.isArray(value) ? value as JsonRecord[] : [];
 

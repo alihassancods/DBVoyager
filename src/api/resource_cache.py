@@ -9,7 +9,7 @@ from functools import lru_cache
 from collections.abc import Callable
 from typing import Any
 
-from fastapi import Request, Response, status
+from fastapi import Request, Response
 
 
 CACHE_TTL_SECONDS = 60
@@ -157,6 +157,4 @@ def cached_json(request: Request, connection_id: str, resource: str, build: Call
         "Cache-Control": f"private, max-age={CACHE_TTL_SECONDS}, must-revalidate",
         "X-Cache": cache_state,
     }
-    if request.headers.get("if-none-match") == etag:
-        return Response(status_code=status.HTTP_304_NOT_MODIFIED, headers=headers)
     return Response(content=body, media_type="application/json", headers=headers)

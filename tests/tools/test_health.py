@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from tools import health
 from tools.health import audit_connection
 
 
@@ -78,3 +79,18 @@ def test_audit_connection_reuses_snapshots_and_returns_plain_entries() -> None:
         "duplicate_indexes", "autovacuum_analyze", "connections", "wal_checkpoints",
     }
     assert connection.cursor_instance.closed is True
+
+
+def test_audit_connection_reports_a_clean_result(monkeypatch) -> None:
+    monkeypatch.setattr(health, "_snapshot_findings", lambda *_args: [])
+    monkeypatch.setattr(health, "_sql_findings", lambda _cursor: [])
+
+    findings = health.audit_connection(FakeConnection(), object())
+
+    assert findings == [{
+        "check": "health_check_completed",
+        "severity": "info",
+        "message": "No health issues were detected.",
+        "impact_score": 10,
+        "action": "Continue monitoring this database.",
+    }]

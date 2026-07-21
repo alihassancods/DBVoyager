@@ -128,6 +128,48 @@ def test_dashboard_refresh_persists_and_reads_the_latest_report() -> None:
     assert diagram.json() == report["schema_visualization"]
 
 
+def test_health_checks_exposes_a_failed_collection() -> None:
+    _connections.clear()
+    _credentials.clear()
+    _connection_owners.clear()
+    register_connection("connection-1", "owner", MagicMock(), {"database": "demo"})
+    app.dependency_overrides[current_user] = lambda: {"sub": "owner"}
+    failed_report = {"health_checks": {"status": "error", "error": "NameError: name '_row' is not defined"}}
+    try:
+        with patch("src.api.dashboard.ensure_owned_database"), patch(
+            "src.api.dashboard.get_latest_health_findings", side_effect=HTTPException(status_code=404)
+        ), patch("src.api.dashboard.get_latest_collection_report", return_value=failed_report), patch(
+            "src.api.dashboard.has_active_analysis", return_value=False
+        ):
+            response = client.get("/connections/connection-1/health-checks")
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 502
+    assert response.json() == {"detail": "NameError: name '_row' is not defined"}
+
+
+def test_health_checks_waits_for_an_active_refresh() -> None:
+    _connections.clear()
+    _credentials.clear()
+    _connection_owners.clear()
+    register_connection("connection-1", "owner", MagicMock(), {"database": "demo"})
+    app.dependency_overrides[current_user] = lambda: {"sub": "owner"}
+    failed_report = {"health_checks": {"status": "error", "error": "old failure"}}
+    try:
+        with patch("src.api.dashboard.ensure_owned_database"), patch(
+            "src.api.dashboard.get_latest_health_findings", side_effect=HTTPException(status_code=404)
+        ), patch("src.api.dashboard.get_latest_collection_report", return_value=failed_report), patch(
+            "src.api.dashboard.has_active_analysis", return_value=True
+        ):
+            response = client.get("/connections/connection-1/health-checks")
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 202
+    assert response.json()["status"] == "collecting"
+
+
 def test_overview_is_collecting_before_the_first_report_exists() -> None:
     app.dependency_overrides[current_user] = lambda: {"sub": "owner"}
     try:

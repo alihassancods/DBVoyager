@@ -1,6 +1,6 @@
 const prefix = 'dbvoyager:resource:';
 const maxEntries = 50;
-const maxAgeMs = 30_000;
+const maxAgeMs = 5 * 60_000;
 const inFlight = new Map<string, Promise<unknown>>();
 type CacheEntry = { value: unknown; fetchedAt: number };
 

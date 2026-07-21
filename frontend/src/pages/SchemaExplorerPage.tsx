@@ -1,8 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Link, useSearchParams } from 'react-router-dom';
-import { authFetch, authJson, requireOk } from '../lib/auth';
-import { trackRouteRequest } from '../lib/routeLoading';
-import { getSection } from '../lib/analysisStore';
+import { authJson } from '../lib/auth';
 import CollectingState from '../components/CollectingState';
 import { DataTable, Modal, useToast } from '../components/ui';
 import { useHeaderSearch } from '../AppShell';
@@ -16,7 +14,7 @@ type Metrics = { total_size_bytes?: number | null; table_size_bytes?: number | n
 type Preview = { columns: string[]; rows: Record<string, unknown>[]; row_count: number };
 type SchemaResponse = { data: { tables: Table[]; relationships: Relationship[] }; next_offset: number | null };
 
-async function api<T>(path: string, track = false): Promise<T> { return authJson<T>(path, undefined, false, track); }
+async function api<T>(path: string, force = false, track = true): Promise<T> { return authJson<T>(path, undefined, force, track); }
 
 const icon = (name: string, className = '') => <span aria-hidden="true" className={`material-symbols-outlined ${className}`}>{name}</span>;
 const number = (value: number | null | undefined) => value === null || value === undefined ? '—' : new Intl.NumberFormat('en-US', { maximumFractionDigits: 1, notation: value > 999_999 ? 'compact' : 'standard' }).format(value);
@@ -43,7 +41,7 @@ export default function SchemaExplorerPage() {
   const [drawer, setDrawer] = useState(false);
 
   useEffect(() => {
-    void api<{ data: Connection[] }>('/connections', true).then(result => {
+    void api<{ data: Connection[] }>('/connections').then(result => {
       const active = result.data.filter(item => !item.archived_at);
       setConnections(active); setConnectionId(active.some(item => item.connection_id === requestedConnection) ? requestedConnection || '' : active[0]?.connection_id || '');
     }).catch(reason => { setError(reason.message); setLoading(false); });
@@ -53,9 +51,8 @@ export default function SchemaExplorerPage() {
     if (!connectionId) return;
     setLoading(true); setError(''); setCollecting(false);
     try {
-      const response = await trackRouteRequest(authFetch(`/connections/${connectionId}/schema/visualizer?limit=200&offset=${offset}`, {}, false), 'Loading schema…');
-      if (response.status === 202) { setCollecting(true); setLoading(false); return; }
-      const result = await (await requireOk(response)).json() as SchemaResponse;
+      const result = await api<SchemaResponse & { status?: string }>(`/connections/${connectionId}/schema/visualizer?limit=200&offset=${offset}`);
+      if (result.status === 'collecting') { setCollecting(true); return; }
       setTables(current => offset ? [...current, ...result.data.tables] : result.data.tables);
       setRelationships(current => offset ? [...current, ...result.data.relationships] : result.data.relationships);
       setNextOffset(result.next_offset);
@@ -67,13 +64,11 @@ export default function SchemaExplorerPage() {
   };
 
   useEffect(() => { void loadTables(); }, [connectionId]); // eslint-disable-line react-hooks/exhaustive-deps
-  // Rehydrate from cached SSE section data when connection changes
-  useEffect(() => { if (!connectionId) return; const cached = getSection(connectionId, 'schema'); const data = cached?.data as { tables: Table[]; relationships: Relationship[] } | undefined; if (data?.tables) { setTables(data.tables); if (data.relationships) setRelationships(data.relationships); } }, [connectionId]);
   const selected = tables.find(table => tableKey(table) === selectedKey);
   useEffect(() => {
     if (!selected || !connectionId) return;
     setMetrics(null);
-    void api<Metrics>(`/connections/${connectionId}/schema/tables/${encodeURIComponent(selected.schema)}/${encodeURIComponent(selected.name)}/metrics`).then(setMetrics).catch(reason => setError(reason.message));
+    void api<Metrics>(`/connections/${connectionId}/schema/tables/${encodeURIComponent(selected.schema)}/${encodeURIComponent(selected.name)}/metrics`, false, false).then(setMetrics).catch(() => {});
   }, [connectionId, selectedKey]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const visible = useMemo(() => tables.filter(table => (type === 'all' || table.table_type === type) && tableKey(table).toLowerCase().includes(search.trim().toLowerCase())), [tables, type, search]);
@@ -81,7 +76,7 @@ export default function SchemaExplorerPage() {
   const bloat = metrics?.bloat_risk_ratio ?? null;
   function select(table: Table) { setSelectedKey(tableKey(table)); setParams({ connection: connectionId, table: tableKey(table) }); }
   async function copy(text: string) { try { await navigator.clipboard.writeText(text); showToast({ tone: 'success', message: 'SQL copied for review.' }); } catch { const message = 'Clipboard access was unavailable.'; setError(message); showToast({ tone: 'error', message }); } }
-  async function queryData() { if (!selected) return; try { setPreview(await api<Preview>(`/connections/${connectionId}/schema/tables/${encodeURIComponent(selected.schema)}/${encodeURIComponent(selected.name)}/preview?limit=50`, true)); } catch (reason) { setError(reason instanceof Error ? reason.message : 'Could not preview this table.'); } }
+  async function queryData() { if (!selected) return; try { setPreview(await api<Preview>(`/connections/${connectionId}/schema/tables/${encodeURIComponent(selected.schema)}/${encodeURIComponent(selected.name)}/preview?limit=50`)); } catch (reason) { setError(reason instanceof Error ? reason.message : 'Could not preview this table.'); } }
 
   return <div className="mx-auto grid max-w-[1600px] gap-6 p-6 md:grid-cols-[280px_minmax(0,1fr)] md:p-10">
     <aside className="voyager-card h-fit"><header className="border-b border-voyager-border p-4"><div className="flex items-center justify-between"><span className="font-mono text-xs uppercase tracking-widest text-voyager-text-secondary">Tables ({tables.length})</span><select aria-label="Filter table type" value={type} onChange={event => setType(event.target.value)} className="bg-transparent text-voyager-blue outline-none">{['all', 'BASE TABLE', 'VIEW', 'FOREIGN TABLE'].map(value => <option className="bg-voyager-surface" key={value} value={value}>{value === 'all' ? 'Filter' : value}</option>)}</select></div></header><div className="max-h-[60vh] overflow-y-auto p-2">{visible.map(table => <button type="button" key={tableKey(table)} onClick={() => select(table)} className={`flex w-full items-center gap-3 rounded-lg px-3 py-3 text-left text-sm ${selected && tableKey(selected) === tableKey(table) ? 'bg-voyager-blue/10 text-voyager-text-primary' : 'text-voyager-text-secondary hover:bg-voyager-surface2'}`}>{icon(table.table_type === 'VIEW' ? 'table_rows' : 'table_chart', tableKey(selected || table) === tableKey(table) ? 'text-voyager-blue' : '')}<span className="min-w-0 flex-1 truncate">{table.name}</span></button>)}{nextOffset !== null && <button type="button" onClick={() => void loadTables(nextOffset)} className="m-2 text-sm text-voyager-blue">Load more tables</button>}</div></aside>

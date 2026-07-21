@@ -206,7 +206,9 @@ def refresh_health_checks(
     background_tasks: BackgroundTasks,
     user: dict[str, object] = Depends(current_user),
 ) -> dict[str, str]:
-    return _start_collection_run(connection_id, "health_checks", background_tasks, user)
+    result = _start_collection_run(connection_id, "health_checks", background_tasks, user)
+    invalidate(connection_id, "health-checks")
+    return result
 
 
 @router.post("/table-summaries/refresh", status_code=status.HTTP_202_ACCEPTED)
@@ -483,7 +485,9 @@ def health_checks(
                 raise
             section = _section(_collection_report(connection_id, user, "health_checks"), "health_checks")
             if section["status"] != "ok":
-                return section
+                if has_active_analysis(connection_id):
+                    raise HTTPException(status_code=404)
+                raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=section.get("error", "Health check collection failed."))
             findings = section["data"]
         return {"status": "ok", "data": [finding for finding in findings if (severity is None or finding["severity"] == severity) and (check is None or finding["check"] == check)]}
     try:

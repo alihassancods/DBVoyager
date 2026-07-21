@@ -21,7 +21,7 @@ from typing import Any
 
 from src.agent.business_intelligence.analysis_agent import AnalysisAgent
 from src.agent.business_intelligence.planner_agent import PlannerAgent
-from sql_generation_agent import SQLGenerationAgent
+from src.agent.business_intelligence.sql_generation_agent import SQLGenerationAgent
 
 from src.models.business_intelligence.investigation_plan import (
     InvestigationPlan,
