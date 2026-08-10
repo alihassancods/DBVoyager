@@ -1,10 +1,11 @@
-"""Main statistics orchestrator with production thread management and fallback safety."""
+"""Main statistics orchestrator with cached TTL lookups and thread safety."""
 
 import logging
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from typing import Any
 
+from src.db_engine.cache.metadata_cache import metadata_cache
 from src.db_engine.inspectors.statistics.database_stats_inspector import (
     DatabaseStatsInspector,
 )
@@ -28,12 +29,13 @@ ConnectionProvider = Callable[[], Any]
 
 
 class StatisticsInspector:
-    """Collect a complete statistics snapshot concurrently with thread timeouts and error isolation."""
+    """Collect database statistics with automatic TTL caching and fallback safety."""
 
     def __init__(
         self,
         connection_provider: ConnectionProvider,
         timeout_seconds: float = 10.0,
+        cache_ttl_seconds: float = 30.0,
     ) -> None:
         self._query_inspector = QueryStatsInspector(connection_provider)
         self._table_inspector = TableStatsInspector(connection_provider)
@@ -41,12 +43,27 @@ class StatisticsInspector:
         self._lock_inspector = LockStatsInspector(connection_provider)
         self._database_inspector = DatabaseStatsInspector(connection_provider)
         self._timeout = timeout_seconds
+        self._cache_ttl = cache_ttl_seconds
         self._logger = logging.getLogger(__name__)
 
     def get_snapshot(
+        self,
+        progress: Callable[[str, str], None] | None = None,
+        use_cache: bool = True,
+        cache_key: str = "default_stats_snapshot",
+    ) -> StatisticsSnapshot:
+        """Fetch statistics snapshot. Reads from cache if fresh, otherwise inspects DB."""
+        if use_cache:
+            return metadata_cache.get_or_compute(
+                key=cache_key,
+                fetch_fn=lambda: self._get_snapshot_from_db(progress),
+                ttl_seconds=self._cache_ttl,
+            )
+        return self._get_snapshot_from_db(progress)
+
+    def _get_snapshot_from_db(
         self, progress: Callable[[str, str], None] | None = None
     ) -> StatisticsSnapshot:
-        """Collect database statistics concurrently across a thread pool with strict safety bounds."""
         if progress:
             progress("statistics", "Collecting database statistics in parallel.")
 
@@ -70,8 +87,6 @@ class StatisticsInspector:
         database_stats = database_stats_list[0] if database_stats_list else None
 
         if database_stats is None:
-            self._logger.warning("Database statistics object was empty; generating fallback default.")
-            # Fallback if DB stats query returned empty due to permissions
             from src.models.statistics.database_stats_model import DatabaseStats
             database_stats = DatabaseStats(
                 db_name="unknown",

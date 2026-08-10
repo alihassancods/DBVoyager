@@ -1,10 +1,11 @@
-"""Main schema orchestrator with production thread management and fallback safety."""
+"""Main schema orchestrator with cached TTL lookups and thread safety."""
 
 import logging
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from typing import Any
 
+from src.db_engine.cache.metadata_cache import metadata_cache
 from src.db_engine.inspectors.column_inspector import ColumnInspector
 from src.db_engine.inspectors.index_inspector import IndexInspector
 from src.db_engine.inspectors.key_inspector import KeyInspector
@@ -16,33 +17,58 @@ ConnectionProvider = Callable[[], Any]
 
 
 class SchemaInspector:
-    """Collect full database schema metadata concurrently with strict timeout safety."""
+    """Collect full database schema metadata with automatic TTL caching and timeout protection."""
 
     def __init__(
         self,
         connection_provider: ConnectionProvider,
         timeout_seconds: float = 10.0,
+        cache_ttl_seconds: float = 30.0,
     ) -> None:
+        self._connection_provider = connection_provider
         self._table_inspector = TableInspector(connection_provider)
         self._column_inspector = ColumnInspector(connection_provider)
         self._key_inspector = KeyInspector(connection_provider)
         self._index_inspector = IndexInspector(connection_provider)
         self._relation_inspector = RelationInspector()
         self._timeout = timeout_seconds
+        self._cache_ttl = cache_ttl_seconds
         self._logger = logging.getLogger(__name__)
 
     @classmethod
     def from_connection_provider(
-        cls, connection_provider: ConnectionProvider, timeout_seconds: float = 10.0
+        cls,
+        connection_provider: ConnectionProvider,
+        timeout_seconds: float = 10.0,
+        cache_ttl_seconds: float = 30.0,
     ) -> "SchemaInspector":
-        return cls(connection_provider=connection_provider, timeout_seconds=timeout_seconds)
+        return cls(
+            connection_provider=connection_provider,
+            timeout_seconds=timeout_seconds,
+            cache_ttl_seconds=cache_ttl_seconds,
+        )
 
     def inspect(
+        self,
+        progress: Callable[[str, str], None] | None = None,
+        use_cache: bool = True,
+        cache_key: str = "default_schema_snapshot",
+    ) -> DatabaseSchema:
+        """Fetch schema metadata. Reads from cache if fresh, otherwise inspects DB."""
+        if use_cache:
+            return metadata_cache.get_or_compute(
+                key=cache_key,
+                fetch_fn=lambda: self._inspect_from_db(progress),
+                ttl_seconds=self._cache_ttl,
+            )
+        return self._inspect_from_db(progress)
+
+    def _inspect_from_db(
         self, progress: Callable[[str, str], None] | None = None
     ) -> DatabaseSchema:
-        """Inspect schema concurrently across parallel threads with safety bounds."""
+        """Executes actual network queries across parallel threads."""
         if progress:
-            progress("schema", "Collecting schema metadata in parallel.")
+            progress("schema", "Collecting schema metadata in parallel from Postgres.")
 
         with ThreadPoolExecutor(max_workers=5) as executor:
             f_tables = executor.submit(
@@ -71,7 +97,6 @@ class SchemaInspector:
                 self._logger.error("Schema inspection timed out after %s seconds", self._timeout)
                 raise RuntimeError(f"Schema inspection timed out after {self._timeout}s")
 
-        # In-memory relation construction from extracted foreign keys
         try:
             relations = self._relation_inspector.build_relations(foreign_keys)
         except Exception:
