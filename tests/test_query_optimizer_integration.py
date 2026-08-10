@@ -1,40 +1,147 @@
-from src.db_engine.connection import get_connection
-
-from src.db_engine.inspectors.schema_inspector import (
-    SchemaInspector,
-)
-
-from src.db_engine.inspectors.statistics.query_stats_inspector import (
-    QueryStatsInspector,
-)
-
-from src.db_engine.inspectors.explain_plan_inspector import (
-    ExplainPlanInspector,
-)
+import json
+from unittest.mock import Mock, patch
 
 from src.agent.query_optimizer.optimizer_agent import (
     QueryOptimizerAgent,
 )
+from src.agent.query_optimizer.models import (
+    LLMOptimizationResponse,
+)
+from src.models.statistics.query_stats_model import (
+    QueryStats,
+)
+from src.models.schema.schema_model import (
+    DatabaseSchema,
+)
 
 
-def connection_provider():
-    return get_connection()
-
-
-def test_real_slow_queries():
-
-    agent = QueryOptimizerAgent(
-        query_stats_inspector=QueryStatsInspector(
-            connection_provider
-        ),
-        schema_inspector=SchemaInspector.from_connection_provider(
-            connection_provider
-        ),
-        explain_plan_inspector=ExplainPlanInspector(
-            connection_provider
-        ),
+def _dummy_schema() -> DatabaseSchema:
+    """Helper to return an empty schema mock for unit tests."""
+    return DatabaseSchema(
+        tables=[],
+        columns=[],
+        primary_keys=[],
+        foreign_keys=[],
+        relations=[],
+        indexes=[],
     )
 
-    queries = agent.get_slow_queries()
 
-    assert isinstance(queries, list)
+def test_get_slow_queries():
+    query_stats_inspector = Mock()
+    schema_inspector = Mock()
+    schema_inspector.inspect.return_value = _dummy_schema()
+    explain_plan_inspector = Mock()
+
+    query_stats_inspector.get_query_stats.return_value = [
+        QueryStats(
+            query="SELECT 1",
+            calls=10,
+            total_exec_time=100,
+            mean_exec_time=10,
+            rows_returned=1,
+        ),
+        QueryStats(
+            query="SELECT 2",
+            calls=10,
+            total_exec_time=500,
+            mean_exec_time=50,
+            rows_returned=1,
+        ),
+        QueryStats(
+            query="SELECT 3",
+            calls=10,
+            total_exec_time=300,
+            mean_exec_time=30,
+            rows_returned=1,
+        ),
+    ]
+
+    agent = QueryOptimizerAgent(
+        query_stats_inspector=query_stats_inspector,
+        schema_inspector=schema_inspector,
+        explain_plan_inspector=explain_plan_inspector,
+        enable_auto_refresh=False,
+    )
+
+    slow_queries = agent.get_slow_queries()
+
+    assert len(slow_queries) == 3
+    assert slow_queries[0].query == "SELECT 2"
+    assert slow_queries[1].query == "SELECT 3"
+    assert slow_queries[2].query == "SELECT 1"
+
+
+def test_compare_queries():
+    query_stats_inspector = Mock()
+    schema_inspector = Mock()
+    schema_inspector.inspect.return_value = _dummy_schema()
+    explain_plan_inspector = Mock()
+
+    before_costs = Mock()
+    before_costs.startup_cost = 10
+    before_costs.total_cost = 100
+    before_costs.plan_rows = 1000
+
+    after_costs = Mock()
+    after_costs.startup_cost = 5
+    after_costs.total_cost = 50
+    after_costs.plan_rows = 1000
+
+    before_plan = Mock()
+    before_plan.costs = before_costs
+
+    after_plan = Mock()
+    after_plan.costs = after_costs
+
+    explain_plan_inspector.get_plan.side_effect = [
+        before_plan,
+        after_plan,
+    ]
+
+    agent = QueryOptimizerAgent(
+        query_stats_inspector=query_stats_inspector,
+        schema_inspector=schema_inspector,
+        explain_plan_inspector=explain_plan_inspector,
+        enable_auto_refresh=False,
+    )
+
+    result = agent.compare_queries(
+        "SELECT * FROM orders",
+        "SELECT id FROM orders",
+    )
+
+    assert result.total_cost_before == 100
+    assert result.total_cost_after == 50
+    assert result.improvement_percent == 50.0
+
+
+def test_optimize_continues_when_historical_query_cannot_be_explained():
+    query_stats_inspector = Mock()
+    schema_inspector = Mock()
+    schema_inspector.inspect.return_value = _dummy_schema()
+    explain_plan_inspector = Mock()
+    explain_plan_inspector.get_plan.side_effect = RuntimeError(
+        "Execution plan generation failed: 42803"
+    )
+    llm = Mock()
+    llm.invoke.return_value.content = json.dumps({
+        "optimized_query": "SELECT 1",
+        "explanation": "Use a valid grouped expression.",
+        "index_recommendations": [],
+    })
+
+    with patch(
+        "src.agent.query_optimizer.optimizer_agent.create_deepseek_llm",
+        return_value=llm,
+    ):
+        agent = QueryOptimizerAgent(
+            query_stats_inspector=query_stats_inspector,
+            schema_inspector=schema_inspector,
+            explain_plan_inspector=explain_plan_inspector,
+            enable_auto_refresh=False,
+        )
+        result = agent.optimize_query("SELECT DATE_TRUNC($1, created_at) FROM orders")
+
+    assert result.optimized_query == "SELECT 1"
+    assert "unavailable" in llm.invoke.call_args.args[0][0].content

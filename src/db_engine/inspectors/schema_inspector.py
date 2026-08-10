@@ -1,7 +1,8 @@
-"""Service for assembling complete PostgreSQL schema metadata."""
+"""Service for assembling complete PostgreSQL schema metadata using concurrent execution."""
 
 import logging
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from src.db_engine.inspectors.column_inspector import ColumnInspector
@@ -13,7 +14,7 @@ from src.models.schema.schema_model import DatabaseSchema
 
 
 class SchemaInspector:
-    """Coordinate metadata inspectors to produce a complete database schema."""
+    """Coordinate metadata inspectors concurrently to produce a complete database schema."""
 
     def __init__(
         self,
@@ -34,7 +35,7 @@ class SchemaInspector:
     def from_connection_provider(
         cls, connection_provider: Callable[[], Any]
     ) -> "SchemaInspector":
-        """Build an inspector that obtains a fresh connection per metadata query."""
+        """Build an inspector that obtains fresh connections per query for parallel execution."""
         return cls(
             table_inspector=TableInspector(connection_provider),
             column_inspector=ColumnInspector(connection_provider),
@@ -44,24 +45,31 @@ class SchemaInspector:
         )
 
     def inspect(self, progress: Callable[[str, str], None] | None = None) -> DatabaseSchema:
-        """Collect and assemble all supported database schema metadata."""
+        """Collect and assemble database schema metadata concurrently using a thread pool."""
         try:
-            def collect(name: str, callback: Callable[[], Any]) -> Any:
-                if progress:
-                    progress("schema", f"Collecting {name}.")
-                result = callback()
-                if progress:
-                    progress("schema", f"Collected {len(result)} {name}.")
-                return result
-
-            tables = collect("table metadata", self._table_inspector.get_tables)
-            columns = collect("column metadata", self._column_inspector.get_columns)
-            primary_keys = collect("primary keys", self._key_inspector.get_primary_keys)
-            foreign_keys = collect("foreign keys", self._key_inspector.get_foreign_keys)
-            relations = self._relation_inspector.build_relations(foreign_keys)
             if progress:
-                progress("schema", "Building table relationships.")
-            indexes = collect("indexes", self._index_inspector.get_indexes)
+                progress("schema", "Starting concurrent schema inspection.")
+
+            # Run 5 database metadata queries in parallel
+            with ThreadPoolExecutor(max_workers=5) as executor:
+                f_tables = executor.submit(self._table_inspector.get_tables)
+                f_columns = executor.submit(self._column_inspector.get_columns)
+                f_pks = executor.submit(self._key_inspector.get_primary_keys)
+                f_fks = executor.submit(self._key_inspector.get_foreign_keys)
+                f_indexes = executor.submit(self._index_inspector.get_indexes)
+
+                tables = f_tables.result()
+                columns = f_columns.result()
+                primary_keys = f_pks.result()
+                foreign_keys = f_fks.result()
+                indexes = f_indexes.result()
+
+            # Assemble relations in-memory from foreign keys
+            relations = self._relation_inspector.build_relations(foreign_keys)
+
+            if progress:
+                progress("schema", "Schema inspection complete.")
+
             return DatabaseSchema(
                 tables=tables,
                 columns=columns,
