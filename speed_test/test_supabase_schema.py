@@ -1,4 +1,4 @@
-"""Live performance and latency benchmark for SchemaInspector against Supabase."""
+"""Live performance and latency benchmark for Business Intelligence components against Supabase."""
 
 import os
 import time
@@ -6,12 +6,12 @@ import pytest
 from dotenv import load_dotenv
 
 from src.db_engine.connection import get_connection
-from src.db_engine.inspectors.column_inspector import ColumnInspector
-from src.db_engine.inspectors.index_inspector import IndexInspector
-from src.db_engine.inspectors.key_inspector import KeyInspector
-from src.db_engine.inspectors.relation_inspector import RelationInspector
-from src.db_engine.inspectors.schema_inspector import SchemaInspector
-from src.db_engine.inspectors.table_inspector import TableInspector
+from src.db_engine.inspectors.query_executor_inspector import QueryExecutorInspector
+from src.models.business_intelligence.chart import Chart
+from src.models.business_intelligence.generated_sql import GeneratedSQL
+from src.models.business_intelligence.insight import Insight
+from src.models.business_intelligence.investigation_plan import InvestigationPlan
+from src.models.business_intelligence.sql_result import SQLResult
 
 load_dotenv()
 
@@ -24,11 +24,11 @@ def _get_conn():
     not (os.getenv("DB_HOST") or os.getenv("DATABASE_URL")),
     reason="Supabase database credentials not configured in .env",
 )
-def test_supabase_schema_inspection_benchmark():
-    """Profiles network connection time, individual sub-inspectors, and total inspection latency."""
+def test_supabase_bi_execution_benchmark():
+    """Profiles network connection time, query execution, and BI model parsing latency."""
 
     print("\n" + "=" * 65)
-    print("🚀 DBVoyager: Supabase Schema Inspector Performance Profile")
+    print("🚀 DBVoyager: Supabase BI Engine Performance Profile")
     print("=" * 65)
 
     # 1. Connection Handshake Latency
@@ -39,74 +39,90 @@ def test_supabase_schema_inspection_benchmark():
     print(f"🔌 Supabase Handshake Time : {conn_time_ms:.2f} ms")
     print("-" * 65)
 
-    print(f"{'Inspector Component':<25} | {'Latency (ms)':<15}")
+    print(f"{'BI Component':<32} | {'Latency (ms)':<15}")
     print("-" * 65)
 
     total_sub_ms = 0.0
 
-    # 2. Table Inspector
+    # 2. InvestigationPlan Validation Speed
     t_start = time.perf_counter()
-    tables = TableInspector(_get_conn).get_tables()
+    plan = InvestigationPlan(
+        question="Which user tables have the highest live tuple counts?",
+        tables=["pg_stat_user_tables"],
+        metrics=["n_live_tup"],
+        dimensions=["relname"],
+    )
     elapsed = (time.perf_counter() - t_start) * 1000
     total_sub_ms += elapsed
-    print(f"{'TableInspector':<25} | {elapsed:>10.2f} ms")
+    print(f"{'InvestigationPlan Validation':<32} | {elapsed:>10.2f} ms (in-memory)")
 
-    # 3. Column Inspector
+    # 3. GeneratedSQL Model Parsing Speed
+    test_sql = "SELECT relname, n_live_tup FROM pg_stat_user_tables ORDER BY n_live_tup DESC"
     t_start = time.perf_counter()
-    columns = ColumnInspector(_get_conn).get_columns()
+    gen_sql = GeneratedSQL(sql=test_sql)
     elapsed = (time.perf_counter() - t_start) * 1000
     total_sub_ms += elapsed
-    print(f"{'ColumnInspector':<25} | {elapsed:>10.2f} ms")
+    print(f"{'GeneratedSQL Model Parsing':<32} | {elapsed:>10.2f} ms (in-memory)")
 
-    # 4. Key Inspector (Primary Keys)
-    key_inspector = KeyInspector(_get_conn)
+    # 4. Live Query Execution Performance (QueryExecutorInspector)
     t_start = time.perf_counter()
-    primary_keys = key_inspector.get_primary_keys()
+    executor = QueryExecutorInspector(_get_conn)
+    result: SQLResult = executor.execute_query(gen_sql.sql)
     elapsed = (time.perf_counter() - t_start) * 1000
     total_sub_ms += elapsed
-    print(f"{'KeyInspector (PKs)':<25} | {elapsed:>10.2f} ms")
+    print(f"{'QueryExecutorInspector':<32} | {elapsed:>10.2f} ms")
 
-    # 5. Key Inspector (Foreign Keys)
+    # 5. Chart Model Synthesis Speed
     t_start = time.perf_counter()
-    foreign_keys = key_inspector.get_foreign_keys()
+    chart = Chart(
+        title="Top Tables by Tuple Density",
+        chart_type="bar",
+        x_axis="relname",
+        y_axis="n_live_tup",
+    )
     elapsed = (time.perf_counter() - t_start) * 1000
     total_sub_ms += elapsed
-    print(f"{'KeyInspector (FKs)':<25} | {elapsed:>10.2f} ms")
+    print(f"{'Chart Model Synthesis':<32} | {elapsed:>10.2f} ms (in-memory)")
 
-    # 6. Index Inspector
+    # 6. Insight Payload Construction Speed
     t_start = time.perf_counter()
-    indexes = IndexInspector(_get_conn).get_indexes()
+    insight = Insight(
+        summary="Retrieved live tuple density across public schema tables.",
+        evidence=[f"Executed query returned {len(result.rows)} table records."],
+        recommendations=["Run VACUUM ANALYZE if dead tuples exceed threshold."],
+    )
     elapsed = (time.perf_counter() - t_start) * 1000
     total_sub_ms += elapsed
-    print(f"{'IndexInspector':<25} | {elapsed:>10.2f} ms")
-
-    # 7. Relation Inspector (In-Memory Transformation)
-    t_start = time.perf_counter()
-    relations = RelationInspector().build_relations(foreign_keys)
-    elapsed = (time.perf_counter() - t_start) * 1000
-    total_sub_ms += elapsed
-    print(f"{'RelationInspector':<25} | {elapsed:>10.2f} ms (in-memory)")
+    print(f"{'Insight Assembly':<32} | {elapsed:>10.2f} ms (in-memory)")
 
     print("-" * 65)
 
-    # 8. Full Orchestrated SchemaInspector Run
+    # 7. Total End-to-End Orchestrated BI Workflow
     t_full_start = time.perf_counter()
-    full_inspector = SchemaInspector.from_connection_provider(_get_conn)
-    schema = full_inspector.inspect()
+    exec_full = QueryExecutorInspector(_get_conn)
+    res_full = exec_full.execute_query(gen_sql.sql)
+    chart_full = Chart(
+        title="Top Tables", chart_type="bar", x_axis="relname", y_axis="n_live_tup"
+    )
+    insight_full = Insight(
+        summary="BI payload processed successfully.",
+        evidence=[f"Fetched {len(res_full.rows)} records."],
+        recommendations=["All metrics normal."],
+    )
     full_elapsed_ms = (time.perf_counter() - t_full_start) * 1000
 
     print(f"⚡ Cumulative Sub-Runs Total     : {total_sub_ms:.2f} ms")
-    print(f"🚀 Total SchemaInspector Run     : {full_elapsed_ms:.2f} ms ({full_elapsed_ms / 1000:.2f} s)")
+    print(f"🚀 Total BI Workflow Run        : {full_elapsed_ms:.2f} ms ({full_elapsed_ms / 1000:.2f} s)")
     print("-" * 65)
     print(
-        f"📊 Summary: Discovered {len(schema.tables)} tables, "
-        f"{len(schema.columns)} columns, {len(schema.indexes)} indexes"
+        f"📊 Summary: Executed BI query successfully, parsed {len(res_full.rows)} row(s), "
+        f"generated chart '{chart_full.title}'"
     )
     print("=" * 65)
 
-    assert schema is not None
-    assert len(schema.tables) == len(tables)
+    assert res_full is not None
+    assert isinstance(res_full, SQLResult)
 
 
 if __name__ == "__main__":
-    test_supabase_schema_inspection_benchmark()
+    test_supabase_bi_execution_benchmark()
